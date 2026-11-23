@@ -113,6 +113,45 @@ export class GeminiBrowserWorker {
     }
 
     await this.checkSession();
+    await this.dismissModals();
+  }
+
+  /**
+   * Closes any overlay popups, onboardings, banners or dialogs (e.g. "Let Gemini personalize using memory").
+   */
+  async dismissModals() {
+    try {
+      const modalButtonSelectors = [
+        '.cdk-overlay-container button:has-text("Got it")',
+        '.cdk-overlay-container button:has-text("Not now")',
+        '.cdk-overlay-container button:has-text("Понятно")',
+        '.cdk-overlay-container button:has-text("Не сейчас")',
+        '.cdk-overlay-container button:has-text("Dismiss")',
+        '.cdk-overlay-container button:has-text("Close")',
+        '.cdk-overlay-container button:has-text("Закрыть")',
+        'button[aria-label="Close" i]',
+        'button[aria-label="Закрыть" i]',
+        'button:has-text("Accept all")',
+        'button:has-text("Принять все")',
+        'button:has-text("I agree")',
+        'button:has-text("Согласен")'
+      ];
+
+      for (const selector of modalButtonSelectors) {
+        const btn = this.page.locator(selector).first();
+        if (await btn.isVisible().catch(() => false)) {
+          console.info(`[BrowserWorker] Dismissing modal overlay button: ${selector}`);
+          await btn.click({ force: true }).catch(() => {});
+          await this.page.waitForTimeout(300);
+          break;
+        }
+      }
+
+      // Send Escape key as a fallback to dismiss any active dialogs/popovers
+      await this.page.keyboard.press('Escape').catch(() => {});
+    } catch {
+      // Non-critical, ignore dismissal errors
+    }
   }
 
   /**
@@ -239,6 +278,9 @@ export class GeminiBrowserWorker {
 
     await this.handleAction(action, chatId);
 
+    // Dismiss any modal overlays (like "Let Gemini personalize using memory")
+    await this.dismissModals();
+
     // Locate the prompt input area
     const inputSelectors = [
       'rich-textarea div[contenteditable="true"]',
@@ -258,6 +300,8 @@ export class GeminiBrowserWorker {
     }
 
     if (!inputElement) {
+      // Dismiss modals in case a popup is delaying input visibility
+      await this.dismissModals();
       // Give a brief wait in case page is still hydrating
       const fallback = this.page.locator('rich-textarea, [role="textbox"], div[contenteditable="true"]').first();
       await fallback.waitFor({ state: 'visible', timeout: 15000 }).catch(async () => {
@@ -267,12 +311,17 @@ export class GeminiBrowserWorker {
       inputElement = fallback;
     }
 
-    // Focus input and safely insert text without triggering Enter on newlines
-    await inputElement.click();
+    // Dismiss any remaining overlays before clicking
+    await this.dismissModals();
+
+    // Focus input with force: true and direct focus to avoid pointer-intercept timeouts
+    await inputElement.click({ force: true }).catch(() => {});
+    await inputElement.focus().catch(() => {});
+
     try {
       await inputElement.fill(prompt);
     } catch {
-      await inputElement.focus();
+      await inputElement.focus().catch(() => {});
       await this.page.keyboard.press('ControlOrMeta+A');
       await this.page.keyboard.press('Backspace');
       await this.page.keyboard.insertText(prompt);
@@ -299,7 +348,7 @@ export class GeminiBrowserWorker {
         // Check if button is enabled
         const isDisabled = await btn.isDisabled().catch(() => false);
         if (!isDisabled) {
-          await btn.click().catch(() => {});
+          await btn.click({ force: true }).catch(() => {});
           sent = true;
           break;
         }
