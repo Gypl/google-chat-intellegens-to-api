@@ -186,7 +186,7 @@ export class GeminiBrowserWorker {
   async reloadAuth() {
     console.info('[BrowserWorker] Reloading auth state from disk...');
     if (this.context) {
-      await this.context.close().catch(() => {});
+      await this.context.close().catch(() => { });
     }
     this.isInitialized = false;
     await this.init();
@@ -215,7 +215,7 @@ export class GeminiBrowserWorker {
       for (const selector of newChatSelectors) {
         const btn = this.page.locator(selector).first();
         if (await btn.isVisible().catch(() => false)) {
-          await btn.click().catch(() => {});
+          await btn.click().catch(() => { });
           clicked = true;
           break;
         }
@@ -273,7 +273,7 @@ export class GeminiBrowserWorker {
     const dismissBtn = this.page.locator(dismissSelectors.join(', ')).first();
     if (await dismissBtn.isVisible().catch(() => false)) {
       console.info('[BrowserWorker] Dismissing promo/location modal dialog...');
-      await dismissBtn.click().catch(() => {});
+      await dismissBtn.click().catch(() => { });
       await this.page.waitForTimeout(300);
     }
   }
@@ -338,7 +338,7 @@ export class GeminiBrowserWorker {
       const isExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
       if (isExpanded !== 'true') {
         console.info('[BrowserWorker] Opening model selector menu...');
-        await btn.click({ force: true }).catch(() => {});
+        await btn.click({ force: true }).catch(() => { });
         await this.page.waitForTimeout(400);
       }
     };
@@ -354,7 +354,7 @@ export class GeminiBrowserWorker {
       if (await modelOption.count() > 0) {
         const isChecked = await modelOption.getAttribute('aria-checked').catch(() => null);
         if (isChecked !== 'true') {
-          await modelOption.click().catch(() => {});
+          await modelOption.click().catch(() => { });
           await this.page.waitForTimeout(500);
         }
       } else {
@@ -378,7 +378,7 @@ export class GeminiBrowserWorker {
         .first();
 
       if (await thinkingHeader.isVisible().catch(() => false)) {
-        await thinkingHeader.hover().catch(() => {});
+        await thinkingHeader.hover().catch(() => { });
         await this.page.waitForTimeout(250);
 
         const testVisible = await this.page
@@ -389,7 +389,7 @@ export class GeminiBrowserWorker {
           .catch(() => false);
 
         if (!testVisible) {
-          await thinkingHeader.click().catch(() => {});
+          await thinkingHeader.click().catch(() => { });
           await this.page.waitForTimeout(250);
         }
       }
@@ -399,7 +399,7 @@ export class GeminiBrowserWorker {
         const isChecked = await thinkingOption.getAttribute('aria-checked').catch(() => null);
         if (isChecked !== 'true') {
           console.info(`[BrowserWorker] Selecting thinking level "${thinkingLevel}"...`);
-          await thinkingOption.click().catch(() => {});
+          await thinkingOption.click().catch(() => { });
           await this.page.waitForTimeout(400);
         }
       } else {
@@ -410,7 +410,7 @@ export class GeminiBrowserWorker {
     // Close menu if still expanded
     const stillExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
     if (stillExpanded === 'true') {
-      await this.page.keyboard.press('Escape').catch(() => {});
+      await this.page.keyboard.press('Escape').catch(() => { });
       await this.page.waitForTimeout(200);
     }
 
@@ -474,6 +474,8 @@ export class GeminiBrowserWorker {
     }
 
     if (!inputElement) {
+      // Dismiss modals in case a popup is delaying input visibility
+      await this.dismissModals();
       // Give a brief wait in case page is still hydrating
       const fallback = this.page.locator('rich-textarea, [role="textbox"], div[contenteditable="true"]').first();
       await fallback.waitFor({ state: 'visible', timeout: 15000 }).catch(async () => {
@@ -515,7 +517,7 @@ export class GeminiBrowserWorker {
         // Check if button is enabled
         const isDisabled = await btn.isDisabled().catch(() => false);
         if (!isDisabled) {
-          await btn.click().catch(() => {});
+          await btn.click().catch(() => { });
           sent = true;
           break;
         }
@@ -653,10 +655,10 @@ export class GeminiBrowserWorker {
     console.info('[BrowserWorker] Closing browser worker...');
     try {
       if (this.context) {
-        await this.context.close().catch(() => {});
+        await this.context.close().catch(() => { });
       }
       if (this.browser) {
-        await this.browser.close().catch(() => {});
+        await this.browser.close().catch(() => { });
       }
     } finally {
       this.isInitialized = false;
