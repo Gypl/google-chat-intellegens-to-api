@@ -26,7 +26,13 @@ export class RequestDispatcher {
    * Enqueues a prompt request to the FIFO queue.
    * Throws QueueFullError (HTTP 429) if queue waiting count >= 50.
    */
-  async enqueue({ prompt, action = 'continue', chatId = null }) {
+  async enqueue({
+    prompt,
+    action = 'continue',
+    chatId = null,
+    model = config.defaultModel,
+    thinkingLevel = config.defaultThinkingLevel
+  }) {
     // If paused due to expired session, reject immediately with 401
     if (this.isPausedForAuth) {
       throw new SessionExpiredError();
@@ -40,7 +46,10 @@ export class RequestDispatcher {
     // Schedule task in strict FIFO order
     return this.queue.add(async () => {
       try {
-        const result = await browserWorker.sendMessage(prompt, action, chatId);
+        const result = await browserWorker.sendMessage(prompt, action, chatId, {
+          model,
+          thinkingLevel
+        });
         return result;
       } catch (err) {
         if (err instanceof SessionExpiredError) {

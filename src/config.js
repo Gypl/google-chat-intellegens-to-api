@@ -3,10 +3,17 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+export const DEFAULT_MODEL = 'gemini-4-neon';
+export const DEFAULT_THINKING_LEVEL = 'high';
+
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   host: process.env.HOST || '0.0.0.0',
   logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Model & Thinking Level Defaults
+  defaultModel: process.env.DEFAULT_MODEL || DEFAULT_MODEL,
+  defaultThinkingLevel: process.env.DEFAULT_THINKING_LEVEL || DEFAULT_THINKING_LEVEL,
 
   // Authentication & Gemini Web URLs
   authStatePath: path.resolve(process.cwd(), process.env.AUTH_STATE_PATH || 'auth_state.json'),

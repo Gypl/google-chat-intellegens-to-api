@@ -1,9 +1,11 @@
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
-import { config } from './config.js';
+import { config, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL } from './config.js';
 import { browserWorker } from './browser.js';
 import { requestDispatcher } from './queue.js';
 import { QueueFullError, SessionExpiredError } from './errors.js';
+
+export { DEFAULT_MODEL, DEFAULT_THINKING_LEVEL };
 
 export function buildServer() {
   const fastify = Fastify({
@@ -100,13 +102,21 @@ export function buildServer() {
               type: 'string',
               enum: ['new', 'continue']
             },
-            chat_id: { type: 'string' }
+            chat_id: { type: 'string' },
+            model: { type: 'string' },
+            thinking_level: { type: 'string' }
           }
         }
       }
     },
     async (request, reply) => {
-      const { messages, action = 'continue', chat_id } = request.body;
+      const {
+        messages,
+        action = 'continue',
+        chat_id,
+        model = config.defaultModel,
+        thinking_level = config.defaultThinkingLevel
+      } = request.body;
 
       // Extract the latest user message
       const userMessages = messages.filter((m) => m.role === 'user');
@@ -125,15 +135,22 @@ export function buildServer() {
         });
       }
 
+      const targetModel = (typeof model === 'string' && model.trim()) || config.defaultModel;
+      const targetThinkingLevel =
+        (typeof thinking_level === 'string' && thinking_level.trim()) || config.defaultThinkingLevel;
+
       // Schedule task via FIFO Queue Dispatcher
       const assistantContent = await requestDispatcher.enqueue({
         prompt,
         action,
-        chatId: chat_id
+        chatId: chat_id,
+        model: targetModel,
+        thinkingLevel: targetThinkingLevel
       });
 
       // OpenAI-compatible response format
       return {
+        model: targetModel,
         choices: [
           {
             message: {

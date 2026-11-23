@@ -11,6 +11,7 @@
 * **Singleton Browser Worker:** Один процесс Chromium с одной вкладкой для исключения утечек памяти и накладных расходов на открытие/закрытие браузера.
 * **Экстремальная оптимизация памяти:** Блокировка загрузки тяжелых ресурсов через `page.route()` (шрифты, изображения, медиа, телеметрия). Потребление ОЗУ в контейнере жестко ограничено **1.5 ГБ** (типично ~300-600 МБ).
 * **Строгая FIFO-очередь (concurrency: 1):** Запросы выполняются строго по очереди.
+* **Динамический выбор модели и Thinking Level:** Поддержка выбора ИИ-модели (`model`, дефолт: `gemini-4-neon` / "Neon") и уровня размышлений (`thinking_level`, дефолт: `high` / "High" с поддержкой `minimal`, `low`, `medium`, `high`, `xhigh`).
 * **Защита от перегрузки (HTTP 429):** Максимальный размер очереди ожидания — **50 запросов**. При поступлении 51-го запроса сервер мгновенно возвращает `429 Too Many Requests` с телом `{"error": "Queue is full"}`.
 * **Надежная детекция ответа:** Завершение генерации определяется моментом исчезновения кнопки *"Stop generating"* (*"Остановить генерацию"*) из DOM-дерева Gemini.
 * **Управление контекстом (`action` и `chat_id`):** Поддержка создания новых диалогов (`action: "new"`) и удержания/переключения контекста диалога (`action: "continue"` с `chat_id`).
@@ -174,8 +175,10 @@ npm start
 | `messages` | `Array<{role: string, content: string}>` | **Да** | Массив сообщений. Извлекается последнее сообщение пользователя (`role: "user"`). |
 | `action` | `string` (`"continue"` \| `"new"`) | Нет (дефолт `"continue"`) | `"new"` — открывает новый чат Gemini. `"continue"` — удерживает или продолжает диалог. |
 | `chat_id` | `string` | Нет | Идентификатор диалога. Позволяет удерживать сессию или переключаться по сохраненному URL чата. |
+| `model` | `string` | Нет (дефолт `"gemini-4-neon"`) | Имя или идентификатор модели (например, `"gemini-4-neon"`, `"neon"`, `"gemini-4-hydrogen"`, `"hydrogen"`). В интерфейсе отображается как `"Neon"`, `"Hydrogen"`. |
+| `thinking_level` | `string` (`"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"`) | Нет (дефолт `"high"`) | Уровень размышлений ИИ-модели (Thinking level). В интерфейсе Gemini отображается как `"High"`, `"Medium"`, `"Low"` и др. |
 
-#### Пример запроса (Новый диалог):
+#### Пример запроса (Новый диалог с выбором модели):
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
@@ -185,7 +188,9 @@ curl -X POST http://localhost:3000/v1/chat/completions \
       { "role": "user", "content": "Напиши краткое объяснение квантовой запутанности в 2 предложениях." }
     ],
     "action": "new",
-    "chat_id": "session_quantum_42"
+    "chat_id": "session_quantum_42",
+    "model": "gemini-4-neon",
+    "thinking_level": "high"
   }'
 ```
 
@@ -199,7 +204,9 @@ curl -X POST http://localhost:3000/v1/chat/completions \
       { "role": "user", "content": "А теперь переведи это на французский язык." }
     ],
     "action": "continue",
-    "chat_id": "session_quantum_42"
+    "chat_id": "session_quantum_42",
+    "model": "gemini-4-neon",
+    "thinking_level": "high"
   }'
 ```
 
@@ -207,6 +214,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ```json
 {
+  "model": "gemini-4-neon",
   "choices": [
     {
       "message": {
