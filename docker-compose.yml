@@ -1,0 +1,29 @@
+services:
+  gemini-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemini_web_api_wrapper
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - HEADLESS=true
+      - AUTH_STATE_PATH=/app/auth_state.json
+      - MAX_QUEUE_SIZE=50
+      - GENERATION_TIMEOUT_MS=180000
+      - LOG_LEVEL=info
+    volumes:
+      # Mount auth_state.json from host into container
+      - ./auth_state.json:/app/auth_state.json:rw
+    # Resource limits to ensure container does not exceed 1.5GB RAM on 2GB VPS
+    mem_limit: 1536m
+    mem_reservation: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+        reservations:
+          memory: 512M
