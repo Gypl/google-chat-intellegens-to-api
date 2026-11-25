@@ -2,6 +2,13 @@ import fs from 'node:fs';
 import { chromium } from 'playwright';
 import { config } from './config.js';
 import { SessionExpiredError, BrowserWorkerError } from './errors.js';
+import {
+  CODE_BLOCK_MARK_ATTR,
+  COPY_BUTTON_SELECTORS,
+  cleanCodeText,
+  extractCodeBlocksFromMarkdown,
+  extractResponseFromElement
+} from './parser.js';
 
 /**
  * Normalizes model parameter into regex matching pattern and clean name.
@@ -91,6 +98,9 @@ export class GeminiBrowserWorker {
     }
 
     this.context = await this.browser.newContext(contextOptions);
+    await this.context.grantPermissions(['clipboard-read', 'clipboard-write']).catch((err) => {
+      console.warn(`[BrowserWorker] Could not grant clipboard permissions: ${err.message}`);
+    });
 
     // 4. Create single persistent page
     this.page = await this.context.newPage();
@@ -592,60 +602,154 @@ export class GeminiBrowserWorker {
   }
 
   /**
-   * Extracts text or markdown from the latest assistant message.
+   * Attempts to extract raw code from a code block by clicking its Copy button
+   * and reading the clipboard (falling back gracefully if unavailable).
    */
-  async extractLatestResponse() {
-    const responseSelectors = [
+  async readCodeViaCopyButton(blockLocator) {
+    if (!this.page) {
+      return null;
+    }
+
+    let copyBtn = blockLocator.locator(COPY_BUTTON_SELECTORS.join(', ')).first();
+    let isVisible = await copyBtn.isVisible().catch(() => false);
+
+    if (!isVisible) {
+      // Some UIs reveal the copy button only on hover
+      await blockLocator.hover({ timeout: 500 }).catch(() => { });
+      isVisible = await copyBtn.isVisible().catch(() => false);
+    }
+
+    if (!isVisible) {
+      const textBtn = blockLocator
+        .locator('button')
+        .filter({ hasText: /^(copy|copy code|копировать|копировать код)$/i })
+        .first();
+      if (await textBtn.isVisible().catch(() => false)) {
+        copyBtn = textBtn;
+        isVisible = true;
+      }
+    }
+
+    if (!isVisible) {
+      return null;
+    }
+
+    const sentinel = `__GEMINI_API_CLIPBOARD_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
+    let previousClipboard = null;
+    let sentinelWritten = false;
+
+    try {
+      const prep = await this.page.evaluate(async (marker) => {
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+          return { ok: false, prev: null };
+        }
+        let prev = null;
+        try {
+          prev = await navigator.clipboard.readText();
+        } catch {
+          prev = null;
+        }
+        try {
+          await navigator.clipboard.writeText(marker);
+          return { ok: true, prev };
+        } catch {
+          return { ok: false, prev };
+        }
+      }, sentinel);
+
+      if (!prep.ok) {
+        return null;
+      }
+
+      previousClipboard = prep.prev;
+      sentinelWritten = true;
+
+      await copyBtn.click({ timeout: 1000 });
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        await this.page.waitForTimeout(50);
+        const copied = await this.page.evaluate(() => navigator.clipboard.readText().catch(() => null));
+        if (typeof copied === 'string' && copied !== sentinel) {
+          const cleaned = cleanCodeText(copied);
+          return cleaned.length > 0 ? cleaned : null;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    } finally {
+      if (sentinelWritten && previousClipboard !== null) {
+        await this.page
+          .evaluate((prev) => navigator.clipboard.writeText(prev).catch(() => { }), previousClipboard)
+          .catch(() => { });
+      }
+    }
+  }
+
+  /**
+   * Extracts text/markdown and structured code blocks from the latest assistant message.
+   */
+  async extractLatestResponse({ useClipboard = true } = {}) {
+    const selectorGroups = [
       'model-response',
-      '.model-response-text',
-      '.response-container',
-      'message-content'
+      'message-content, .model-response-text, .response-container',
+      '.markdown, div[id^="model-response"]'
     ];
 
-    const responseLocators = this.page.locator(responseSelectors.join(', '));
-    const count = await responseLocators.count();
-
-    if (count === 0) {
-      // Fallback: search general markdown containers
-      const mdLocators = this.page.locator('.markdown, div[id^="model-response"]');
-      const mdCount = await mdLocators.count();
-      if (mdCount > 0) {
-        return (await mdLocators.last().innerText()).trim();
+    let latest = null;
+    for (const selector of selectorGroups) {
+      const locators = this.page.locator(selector);
+      if ((await locators.count()) > 0) {
+        latest = locators.last();
+        break;
       }
+    }
+
+    if (!latest) {
       throw new BrowserWorkerError('No response elements found in Gemini DOM');
     }
 
-    const latest = responseLocators.last();
+    const extracted = await latest.evaluate(extractResponseFromElement, { markBlocks: useClipboard });
+    const rawBlocks = Array.isArray(extracted?.code_blocks) ? extracted.code_blocks : [];
 
-    // Extract inside evaluate to strip non-content UI buttons (thumbs up/down, share, copy)
-    const content = await latest.evaluate((node) => {
-      // Look for the main message content or markdown element
-      const contentEl =
-        node.querySelector('.message-content') ||
-        node.querySelector('.markdown') ||
-        node.querySelector('.model-response-text') ||
-        node;
-
-      // Clone node to safely remove UI buttons without mutating live DOM
-      const clone = contentEl.cloneNode(true);
-
-      // Remove action buttons, toolbars, icon buttons
-      const ignoreSelectors = [
-        'button',
-        '.response-actions',
-        '.action-button',
-        'mat-icon',
-        '[role="toolbar"]',
-        '.copy-button'
-      ];
-      for (const sel of ignoreSelectors) {
-        clone.querySelectorAll(sel).forEach((el) => el.remove());
+    if (useClipboard && rawBlocks.some((b) => b.hasCopyButton)) {
+      try {
+        for (const block of rawBlocks) {
+          if (!block.hasCopyButton) continue;
+          const blockLocator = latest.locator(`[${CODE_BLOCK_MARK_ATTR}="${block.blockIndex}"]`).first();
+          if ((await blockLocator.count()) === 0) continue;
+          const copiedCode = await this.readCodeViaCopyButton(blockLocator);
+          if (copiedCode) {
+            block.code = copiedCode;
+          }
+        }
+      } finally {
+        await latest
+          .evaluate(
+            (root, attr) => {
+              root.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr));
+            },
+            CODE_BLOCK_MARK_ATTR
+          )
+          .catch(() => { });
       }
+    }
 
-      return clone.innerText || clone.textContent || '';
-    });
+    let codeBlocks = rawBlocks.map(({ language, code }) => ({
+      language: language || 'unknown',
+      code
+    }));
 
-    return (content || '').trim();
+    const content = (extracted?.content || '').trim();
+    if (codeBlocks.length === 0 && content) {
+      codeBlocks = extractCodeBlocksFromMarkdown(content);
+    }
+
+    return {
+      content,
+      code_blocks: codeBlocks
+    };
   }
 
   /**

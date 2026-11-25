@@ -4,6 +4,7 @@ import { config, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL } from './config.js';
 import { browserWorker } from './browser.js';
 import { requestDispatcher } from './queue.js';
 import { QueueFullError, SessionExpiredError } from './errors.js';
+import { normalizeAssistantResult } from './parser.js';
 
 export { DEFAULT_MODEL, DEFAULT_THINKING_LEVEL };
 
@@ -140,7 +141,7 @@ export function buildServer() {
         (typeof thinking_level === 'string' && thinking_level.trim()) || config.defaultThinkingLevel;
 
       // Schedule task via FIFO Queue Dispatcher
-      const assistantContent = await requestDispatcher.enqueue({
+      const rawResult = await requestDispatcher.enqueue({
         prompt,
         action,
         chatId: chat_id,
@@ -148,14 +149,17 @@ export function buildServer() {
         thinkingLevel: targetThinkingLevel
       });
 
-      // OpenAI-compatible response format
+      const { content, code_blocks } = normalizeAssistantResult(rawResult);
+
+      // OpenAI-compatible response format with extracted code_blocks
       return {
         model: targetModel,
         choices: [
           {
             message: {
               role: 'assistant',
-              content: assistantContent
+              content,
+              code_blocks
             }
           }
         ]
