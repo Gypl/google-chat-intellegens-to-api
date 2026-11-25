@@ -2,6 +2,46 @@ import fs from 'node:fs';
 import { chromium } from 'playwright';
 import { config } from './config.js';
 import { SessionExpiredError, BrowserWorkerError } from './errors.js';
+import {
+  CODE_BLOCK_MARK_ATTR,
+  COPY_BUTTON_SELECTORS,
+  cleanCodeText,
+  extractCodeBlocksFromMarkdown,
+  extractResponseFromElement
+} from './parser.js';
+
+/**
+ * Normalizes model parameter into regex matching pattern and clean name.
+ */
+export function getModelRegex(model) {
+  const raw = (model || '').toLowerCase().trim();
+  const clean = raw.replace(/^(gemini[-_]?\d*[-_]?|models\/)/i, '').trim();
+  const pattern = clean ? `\\b(${clean}|${raw})\\b` : raw;
+  return { regex: new RegExp(pattern, 'i'), cleanName: clean || raw };
+}
+
+/**
+ * Normalizes thinking level parameter into regex matching pattern.
+ */
+export function getThinkingLevelRegex(level) {
+  const norm = (level || '').toLowerCase().trim();
+  switch (norm) {
+    case 'minimal':
+      return /minimal|минимальн/i;
+    case 'low':
+      return /\blow\b|низк/i;
+    case 'medium':
+      return /medium|средн/i;
+    case 'high':
+      return /\bhigh\b|высок/i;
+    case 'xhigh':
+    case 'extra-high':
+    case 'extra high':
+      return /xhigh|extra-high|extra high|максимальн|очень высок/i;
+    default:
+      return new RegExp(norm, 'i');
+  }
+}
 
 export class GeminiBrowserWorker {
   constructor() {
@@ -11,6 +51,8 @@ export class GeminiBrowserWorker {
     this.isInitialized = false;
     this.sessionExpired = false;
     this.currentChatId = null;
+    this.currentModel = null;
+    this.currentThinkingLevel = null;
     this.chatUrls = new Map(); // chatId -> gemini conversation url
   }
 
@@ -56,6 +98,9 @@ export class GeminiBrowserWorker {
     }
 
     this.context = await this.browser.newContext(contextOptions);
+    await this.context.grantPermissions(['clipboard-read', 'clipboard-write']).catch((err) => {
+      console.warn(`[BrowserWorker] Could not grant clipboard permissions: ${err.message}`);
+    });
 
     // 4. Create single persistent page
     this.page = await this.context.newPage();
@@ -113,45 +158,6 @@ export class GeminiBrowserWorker {
     }
 
     await this.checkSession();
-    await this.dismissModals();
-  }
-
-  /**
-   * Closes any overlay popups, onboardings, banners or dialogs (e.g. "Let Gemini personalize using memory").
-   */
-  async dismissModals() {
-    try {
-      const modalButtonSelectors = [
-        '.cdk-overlay-container button:has-text("Got it")',
-        '.cdk-overlay-container button:has-text("Not now")',
-        '.cdk-overlay-container button:has-text("Понятно")',
-        '.cdk-overlay-container button:has-text("Не сейчас")',
-        '.cdk-overlay-container button:has-text("Dismiss")',
-        '.cdk-overlay-container button:has-text("Close")',
-        '.cdk-overlay-container button:has-text("Закрыть")',
-        'button[aria-label="Close" i]',
-        'button[aria-label="Закрыть" i]',
-        'button:has-text("Accept all")',
-        'button:has-text("Принять все")',
-        'button:has-text("I agree")',
-        'button:has-text("Согласен")'
-      ];
-
-      for (const selector of modalButtonSelectors) {
-        const btn = this.page.locator(selector).first();
-        if (await btn.isVisible().catch(() => false)) {
-          console.info(`[BrowserWorker] Dismissing modal overlay button: ${selector}`);
-          await btn.click({ force: true }).catch(() => {});
-          await this.page.waitForTimeout(300);
-          break;
-        }
-      }
-
-      // Send Escape key as a fallback to dismiss any active dialogs/popovers
-      await this.page.keyboard.press('Escape').catch(() => {});
-    } catch {
-      // Non-critical, ignore dismissal errors
-    }
   }
 
   /**
@@ -190,7 +196,7 @@ export class GeminiBrowserWorker {
   async reloadAuth() {
     console.info('[BrowserWorker] Reloading auth state from disk...');
     if (this.context) {
-      await this.context.close().catch(() => {});
+      await this.context.close().catch(() => { });
     }
     this.isInitialized = false;
     await this.init();
@@ -219,7 +225,7 @@ export class GeminiBrowserWorker {
       for (const selector of newChatSelectors) {
         const btn = this.page.locator(selector).first();
         if (await btn.isVisible().catch(() => false)) {
-          await btn.click().catch(() => {});
+          await btn.click().catch(() => { });
           clicked = true;
           break;
         }
@@ -259,9 +265,187 @@ export class GeminiBrowserWorker {
   }
 
   /**
+   * Dismisses any blocking promo, survey, or location modals if present.
+   */
+  async dismissModals() {
+    const dismissSelectors = [
+      'mat-dialog-container button:has-text("Dismiss")',
+      'mat-dialog-container button:has-text("Close")',
+      'mat-dialog-container button:has-text("Got it")',
+      'mat-dialog-container button:has-text("Понятно")',
+      'mat-dialog-container button:has-text("Закрыть")',
+      '[role="dialog"] button:has-text("Dismiss")',
+      '[role="dialog"] button:has-text("Close")',
+      '[role="dialog"] button:has-text("Got it")',
+      '[role="dialog"] button:has-text("Понятно")',
+      '[role="dialog"] button:has-text("Закрыть")'
+    ];
+    const dismissBtn = this.page.locator(dismissSelectors.join(', ')).first();
+    if (await dismissBtn.isVisible().catch(() => false)) {
+      console.info('[BrowserWorker] Dismissing promo/location modal dialog...');
+      await dismissBtn.click().catch(() => { });
+      await this.page.waitForTimeout(300);
+    }
+  }
+
+  /**
+   * Dynamically checks and selects the requested AI model and thinking level.
+   *
+   * 1. Finds the model selector button (inside/near input area or header).
+   * 2. Inspects currently active model & thinking level; skips UI clicks if already selected.
+   * 3. If switching is required:
+   *    - Opens the mode picker dropdown menu.
+   *    - Clicks the requested model option (e.g. Neon / gemini-4-neon).
+   *    - Opens thinking level submenu/options and selects requested level (minimal/low/medium/high/xhigh).
+   *    - Closes menu and waits 500ms for Gemini frontend to apply settings.
+   */
+  async selectModelAndThinkingLevel(
+    model = config.defaultModel,
+    thinkingLevel = config.defaultThinkingLevel
+  ) {
+    await this.dismissModals();
+
+    const modelButtonSelectors = [
+      '[data-test-id="bard-mode-menu-button"]',
+      'button.input-area-switch',
+      'button[aria-label*="mode picker" i]',
+      'button[aria-label*="model" i]',
+      'button[aria-label*="модел" i]',
+      'button[aria-label*="режим" i]',
+      'button:has-text("Neon")',
+      'button:has-text("Hydrogen")',
+      'button:has-text("Carbon")',
+      'button:has-text("Flash")',
+      'button:has-text("Pro")'
+    ];
+
+    const btn = this.page.locator(modelButtonSelectors.join(', ')).first();
+    const isAttached = await btn.waitFor({ state: 'attached', timeout: 10000 }).then(() => true).catch(() => false);
+    if (!isAttached || !(await btn.isVisible().catch(() => false))) {
+      console.warn('[BrowserWorker] Model selector button not found/visible. Proceeding with default model.');
+      return;
+    }
+
+    const currentText = (await btn.innerText().catch(() => '')).replace(/\s+/g, ' ').toLowerCase();
+    const currentAria = (await btn.getAttribute('aria-label').catch(() => '')).toLowerCase();
+
+    const { regex: modelRegex, cleanName: cleanModel } = getModelRegex(model);
+    const thinkingRegex = getThinkingLevelRegex(thinkingLevel);
+
+    const isModelActive = modelRegex.test(currentText) || modelRegex.test(currentAria);
+    const isThinkingActive = thinkingRegex.test(currentText) || thinkingRegex.test(currentAria);
+
+    if (isModelActive && isThinkingActive) {
+      this.currentModel = model;
+      this.currentThinkingLevel = thinkingLevel;
+      console.info(`[BrowserWorker] Model "${model}" and thinking level "${thinkingLevel}" are already active.`);
+      return;
+    }
+
+    console.info(`[BrowserWorker] Switching model to "${model}" (level: "${thinkingLevel}")...`);
+
+    const ensureMenuOpen = async () => {
+      const isExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
+      if (isExpanded !== 'true') {
+        console.info('[BrowserWorker] Opening model selector menu...');
+        await btn.click({ force: true }).catch(() => { });
+        await this.page.waitForTimeout(400);
+      }
+    };
+
+    await ensureMenuOpen();
+
+    const menuItemSelectors = '[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item';
+
+    // Step 2: Base model selection
+    if (!isModelActive) {
+      console.info(`[BrowserWorker] Selecting base model matching "${cleanModel}"...`);
+      const modelOption = this.page.locator(menuItemSelectors).filter({ hasText: modelRegex }).first();
+      if (await modelOption.count() > 0) {
+        const isChecked = await modelOption.getAttribute('aria-checked').catch(() => null);
+        if (isChecked !== 'true') {
+          await modelOption.click().catch(() => { });
+          await this.page.waitForTimeout(500);
+        }
+      } else {
+        console.warn(`[BrowserWorker] Model option matching "${cleanModel}" not found in menu.`);
+      }
+    }
+
+    // Step 3: Thinking level selection
+    // Note: selecting model closes the menu in Gemini, check if thinking level is still needed
+    const afterModelText = (await btn.innerText().catch(() => '')).replace(/\s+/g, ' ').toLowerCase();
+    const afterModelAria = (await btn.getAttribute('aria-label').catch(() => '')).toLowerCase();
+    const isThinkingStillActive = thinkingRegex.test(afterModelText) || thinkingRegex.test(afterModelAria);
+
+    if (!isThinkingStillActive) {
+      await ensureMenuOpen();
+
+      // Find "Thinking level" (or "Уровень размышлений") expandable menu item
+      const thinkingHeader = this.page
+        .locator('[role="menuitem"], gem-menu-item')
+        .filter({ hasText: /thinking level|уровень размышлений/i })
+        .first();
+
+      if (await thinkingHeader.isVisible().catch(() => false)) {
+        await thinkingHeader.hover().catch(() => { });
+        await this.page.waitForTimeout(250);
+
+        const testVisible = await this.page
+          .locator(menuItemSelectors)
+          .filter({ hasText: thinkingRegex })
+          .first()
+          .isVisible()
+          .catch(() => false);
+
+        if (!testVisible) {
+          await thinkingHeader.click().catch(() => { });
+          await this.page.waitForTimeout(250);
+        }
+      }
+
+      const thinkingOption = this.page.locator(menuItemSelectors).filter({ hasText: thinkingRegex }).first();
+      if (await thinkingOption.isVisible().catch(() => false)) {
+        const isChecked = await thinkingOption.getAttribute('aria-checked').catch(() => null);
+        if (isChecked !== 'true') {
+          console.info(`[BrowserWorker] Selecting thinking level "${thinkingLevel}"...`);
+          await thinkingOption.click().catch(() => { });
+          await this.page.waitForTimeout(400);
+        }
+      } else {
+        console.warn(`[BrowserWorker] Thinking level option matching "${thinkingLevel}" not visible in menu.`);
+      }
+    }
+
+    // Close menu if still expanded
+    const stillExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
+    if (stillExpanded === 'true') {
+      await this.page.keyboard.press('Escape').catch(() => { });
+      await this.page.waitForTimeout(200);
+    }
+
+    // Step 4: Wait for application
+    await this.page.waitForTimeout(500);
+
+    this.currentModel = model;
+    this.currentThinkingLevel = thinkingLevel;
+    console.info(`[BrowserWorker] Model "${model}" and thinking level "${thinkingLevel}" applied successfully.`);
+  }
+
+  /**
    * Sends prompt and waits for full completion.
    */
-  async sendMessage(prompt, action = 'continue', chatId = null) {
+  async sendMessage(prompt, action = 'continue', chatId = null, options = {}) {
+    let targetModel = config.defaultModel;
+    let targetThinkingLevel = config.defaultThinkingLevel;
+
+    if (typeof options === 'object' && options !== null) {
+      if (options.model) targetModel = options.model;
+      if (options.thinkingLevel) targetThinkingLevel = options.thinkingLevel;
+    } else if (typeof options === 'string') {
+      targetModel = options;
+      if (arguments[4]) targetThinkingLevel = arguments[4];
+    }
     if (this.sessionExpired) {
       // Re-check in case user updated auth_state.json
       if (fs.existsSync(config.authStatePath)) {
@@ -278,8 +462,8 @@ export class GeminiBrowserWorker {
 
     await this.handleAction(action, chatId);
 
-    // Dismiss any modal overlays (like "Let Gemini personalize using memory")
-    await this.dismissModals();
+    // Verify and apply requested model and thinking level before entering prompt
+    await this.selectModelAndThinkingLevel(targetModel, targetThinkingLevel);
 
     // Locate the prompt input area
     const inputSelectors = [
@@ -311,17 +495,12 @@ export class GeminiBrowserWorker {
       inputElement = fallback;
     }
 
-    // Dismiss any remaining overlays before clicking
-    await this.dismissModals();
-
-    // Focus input with force: true and direct focus to avoid pointer-intercept timeouts
-    await inputElement.click({ force: true }).catch(() => {});
-    await inputElement.focus().catch(() => {});
-
+    // Focus input and safely insert text without triggering Enter on newlines
+    await inputElement.click();
     try {
       await inputElement.fill(prompt);
     } catch {
-      await inputElement.focus().catch(() => {});
+      await inputElement.focus();
       await this.page.keyboard.press('ControlOrMeta+A');
       await this.page.keyboard.press('Backspace');
       await this.page.keyboard.insertText(prompt);
@@ -348,7 +527,7 @@ export class GeminiBrowserWorker {
         // Check if button is enabled
         const isDisabled = await btn.isDisabled().catch(() => false);
         if (!isDisabled) {
-          await btn.click({ force: true }).catch(() => {});
+          await btn.click().catch(() => { });
           sent = true;
           break;
         }
@@ -423,60 +602,154 @@ export class GeminiBrowserWorker {
   }
 
   /**
-   * Extracts text or markdown from the latest assistant message.
+   * Attempts to extract raw code from a code block by clicking its Copy button
+   * and reading the clipboard (falling back gracefully if unavailable).
    */
-  async extractLatestResponse() {
-    const responseSelectors = [
+  async readCodeViaCopyButton(blockLocator) {
+    if (!this.page) {
+      return null;
+    }
+
+    let copyBtn = blockLocator.locator(COPY_BUTTON_SELECTORS.join(', ')).first();
+    let isVisible = await copyBtn.isVisible().catch(() => false);
+
+    if (!isVisible) {
+      // Some UIs reveal the copy button only on hover
+      await blockLocator.hover({ timeout: 500 }).catch(() => { });
+      isVisible = await copyBtn.isVisible().catch(() => false);
+    }
+
+    if (!isVisible) {
+      const textBtn = blockLocator
+        .locator('button')
+        .filter({ hasText: /^(copy|copy code|копировать|копировать код)$/i })
+        .first();
+      if (await textBtn.isVisible().catch(() => false)) {
+        copyBtn = textBtn;
+        isVisible = true;
+      }
+    }
+
+    if (!isVisible) {
+      return null;
+    }
+
+    const sentinel = `__GEMINI_API_CLIPBOARD_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
+    let previousClipboard = null;
+    let sentinelWritten = false;
+
+    try {
+      const prep = await this.page.evaluate(async (marker) => {
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+          return { ok: false, prev: null };
+        }
+        let prev = null;
+        try {
+          prev = await navigator.clipboard.readText();
+        } catch {
+          prev = null;
+        }
+        try {
+          await navigator.clipboard.writeText(marker);
+          return { ok: true, prev };
+        } catch {
+          return { ok: false, prev };
+        }
+      }, sentinel);
+
+      if (!prep.ok) {
+        return null;
+      }
+
+      previousClipboard = prep.prev;
+      sentinelWritten = true;
+
+      await copyBtn.click({ timeout: 1000 });
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        await this.page.waitForTimeout(50);
+        const copied = await this.page.evaluate(() => navigator.clipboard.readText().catch(() => null));
+        if (typeof copied === 'string' && copied !== sentinel) {
+          const cleaned = cleanCodeText(copied);
+          return cleaned.length > 0 ? cleaned : null;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    } finally {
+      if (sentinelWritten && previousClipboard !== null) {
+        await this.page
+          .evaluate((prev) => navigator.clipboard.writeText(prev).catch(() => { }), previousClipboard)
+          .catch(() => { });
+      }
+    }
+  }
+
+  /**
+   * Extracts text/markdown and structured code blocks from the latest assistant message.
+   */
+  async extractLatestResponse({ useClipboard = true } = {}) {
+    const selectorGroups = [
       'model-response',
-      '.model-response-text',
-      '.response-container',
-      'message-content'
+      'message-content, .model-response-text, .response-container',
+      '.markdown, div[id^="model-response"]'
     ];
 
-    const responseLocators = this.page.locator(responseSelectors.join(', '));
-    const count = await responseLocators.count();
-
-    if (count === 0) {
-      // Fallback: search general markdown containers
-      const mdLocators = this.page.locator('.markdown, div[id^="model-response"]');
-      const mdCount = await mdLocators.count();
-      if (mdCount > 0) {
-        return (await mdLocators.last().innerText()).trim();
+    let latest = null;
+    for (const selector of selectorGroups) {
+      const locators = this.page.locator(selector);
+      if ((await locators.count()) > 0) {
+        latest = locators.last();
+        break;
       }
+    }
+
+    if (!latest) {
       throw new BrowserWorkerError('No response elements found in Gemini DOM');
     }
 
-    const latest = responseLocators.last();
+    const extracted = await latest.evaluate(extractResponseFromElement, { markBlocks: useClipboard });
+    const rawBlocks = Array.isArray(extracted?.code_blocks) ? extracted.code_blocks : [];
 
-    // Extract inside evaluate to strip non-content UI buttons (thumbs up/down, share, copy)
-    const content = await latest.evaluate((node) => {
-      // Look for the main message content or markdown element
-      const contentEl =
-        node.querySelector('.message-content') ||
-        node.querySelector('.markdown') ||
-        node.querySelector('.model-response-text') ||
-        node;
-
-      // Clone node to safely remove UI buttons without mutating live DOM
-      const clone = contentEl.cloneNode(true);
-
-      // Remove action buttons, toolbars, icon buttons
-      const ignoreSelectors = [
-        'button',
-        '.response-actions',
-        '.action-button',
-        'mat-icon',
-        '[role="toolbar"]',
-        '.copy-button'
-      ];
-      for (const sel of ignoreSelectors) {
-        clone.querySelectorAll(sel).forEach((el) => el.remove());
+    if (useClipboard && rawBlocks.some((b) => b.hasCopyButton)) {
+      try {
+        for (const block of rawBlocks) {
+          if (!block.hasCopyButton) continue;
+          const blockLocator = latest.locator(`[${CODE_BLOCK_MARK_ATTR}="${block.blockIndex}"]`).first();
+          if ((await blockLocator.count()) === 0) continue;
+          const copiedCode = await this.readCodeViaCopyButton(blockLocator);
+          if (copiedCode) {
+            block.code = copiedCode;
+          }
+        }
+      } finally {
+        await latest
+          .evaluate(
+            (root, attr) => {
+              root.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr));
+            },
+            CODE_BLOCK_MARK_ATTR
+          )
+          .catch(() => { });
       }
+    }
 
-      return clone.innerText || clone.textContent || '';
-    });
+    let codeBlocks = rawBlocks.map(({ language, code }) => ({
+      language: language || 'unknown',
+      code
+    }));
 
-    return (content || '').trim();
+    const content = (extracted?.content || '').trim();
+    if (codeBlocks.length === 0 && content) {
+      codeBlocks = extractCodeBlocksFromMarkdown(content);
+    }
+
+    return {
+      content,
+      code_blocks: codeBlocks
+    };
   }
 
   /**
@@ -486,16 +759,19 @@ export class GeminiBrowserWorker {
     console.info('[BrowserWorker] Closing browser worker...');
     try {
       if (this.context) {
-        await this.context.close().catch(() => {});
+        await this.context.close().catch(() => { });
       }
       if (this.browser) {
-        await this.browser.close().catch(() => {});
+        await this.browser.close().catch(() => { });
       }
     } finally {
       this.isInitialized = false;
       this.browser = null;
       this.context = null;
       this.page = null;
+      this.currentModel = null;
+      this.currentThinkingLevel = null;
+      this.currentChatId = null;
     }
   }
 }

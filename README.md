@@ -11,9 +11,12 @@
 * **Singleton Browser Worker:** Один процесс Chromium с одной вкладкой для исключения утечек памяти и накладных расходов на открытие/закрытие браузера.
 * **Экстремальная оптимизация памяти:** Блокировка загрузки тяжелых ресурсов через `page.route()` (шрифты, изображения, медиа, телеметрия). Потребление ОЗУ в контейнере жестко ограничено **1.5 ГБ** (типично ~300-600 МБ).
 * **Строгая FIFO-очередь (concurrency: 1):** Запросы выполняются строго по очереди.
+* **Динамический выбор модели и Thinking Level:** Поддержка выбора ИИ-модели (`model`, дефолт: `gemini-4-neon` / "Neon") и уровня размышлений (`thinking_level`, дефолт: `high` / "High" с поддержкой `minimal`, `low`, `medium`, `high`, `xhigh`).
 * **Защита от перегрузки (HTTP 429):** Максимальный размер очереди ожидания — **50 запросов**. При поступлении 51-го запроса сервер мгновенно возвращает `429 Too Many Requests` с телом `{"error": "Queue is full"}`.
 * **Надежная детекция ответа:** Завершение генерации определяется моментом исчезновения кнопки *"Stop generating"* (*"Остановить генерацию"*) из DOM-дерева Gemini.
+* **Извлечение блоков кода (`code_blocks`):** Автоматический парсинг DOM-дерева (и опционально буфера обмена через кнопку *"Copy code"*) для возврата структурированного массива `{ language, code }` без номеров строк и UI-артефактов.
 * **Управление контекстом (`action` и `chat_id`):** Поддержка создания новых диалогов (`action: "new"`) и удержания/переключения контекста диалога (`action: "continue"` с `chat_id`).
+* **Защита эндпоинтов (OpenAPI Bearer Auth):** Все эндпоинты защищены проверкой статического `API_KEY` через заголовок `Authorization: Bearer <API_KEY>` (OpenAI-совместимый формат ошибки `401 invalid_api_key`, timing-safe сравнение). В режиме `NODE_ENV=production` сервер отказывается запускаться без явно заданного `API_KEY`.
 * **Безопасная авторизация без логина на сервере:** Работает по предварительно экспортированному файлу сессии `auth_state.json`. При протухании сессии сервер возвращает `401 Unauthorized` и приостанавливает очередь.
 * **Готовность к Docker:** Поставляется с готовыми `Dockerfile` и `docker-compose.yml`.
 
@@ -39,6 +42,7 @@ gemini_web_api_wrapper/
 │   ├── config.js         # Конфигурация, переменные окружения, Chromium flags
 │   ├── errors.js         # Специфические классы ошибок (401, 429, 500)
 │   ├── browser.js        # Singleton Browser Worker (Playwright, DOM, маршрутизация)
+│   ├── parser.js         # Извлечение ответа и парсинг блоков кода (DOM + Markdown)
 │   ├── queue.js          # FIFO-диспетчер очереди (p-queue, лимит 50)
 │   └── server.js         # Fastify REST API сервер и обработчики сигналов
 ├── test/
@@ -163,6 +167,8 @@ npm start
 
 ## 📡 Спецификация API (Endpoints & Payloads)
 
+Все эндпоинты API защищены схемой **OpenAPI 3.0 HTTP Bearer** (`Authorization: Bearer <API_KEY>`).
+
 ### 1. `POST /v1/chat/completions`
 
 Основной эндпоинт отправки промптов и получения ответа.
@@ -174,18 +180,23 @@ npm start
 | `messages` | `Array<{role: string, content: string}>` | **Да** | Массив сообщений. Извлекается последнее сообщение пользователя (`role: "user"`). |
 | `action` | `string` (`"continue"` \| `"new"`) | Нет (дефолт `"continue"`) | `"new"` — открывает новый чат Gemini. `"continue"` — удерживает или продолжает диалог. |
 | `chat_id` | `string` | Нет | Идентификатор диалога. Позволяет удерживать сессию или переключаться по сохраненному URL чата. |
+| `model` | `string` | Нет (дефолт `"gemini-4-neon"`) | Имя или идентификатор модели (например, `"gemini-4-neon"`, `"neon"`, `"gemini-4-hydrogen"`, `"hydrogen"`). В интерфейсе отображается как `"Neon"`, `"Hydrogen"`. |
+| `thinking_level` | `string` (`"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"`) | Нет (дефолт `"high"`) | Уровень размышлений ИИ-модели (Thinking level). В интерфейсе Gemini отображается как `"High"`, `"Medium"`, `"Low"` и др. |
 
-#### Пример запроса (Новый диалог):
+#### Пример запроса (Новый диалог с выбором модели):
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-custom-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
       { "role": "user", "content": "Напиши краткое объяснение квантовой запутанности в 2 предложениях." }
     ],
     "action": "new",
-    "chat_id": "session_quantum_42"
+    "chat_id": "session_quantum_42",
+    "model": "gemini-4-neon",
+    "thinking_level": "high"
   }'
 ```
 
@@ -193,25 +204,37 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-custom-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
       { "role": "user", "content": "А теперь переведи это на французский язык." }
     ],
     "action": "continue",
-    "chat_id": "session_quantum_42"
+    "chat_id": "session_quantum_42",
+    "model": "gemini-4-neon",
+    "thinking_level": "high"
   }'
 ```
 
 #### Формат успешного ответа (HTTP 200 OK):
 
+Помимо полного текстового ответа `content`, объект сообщения содержит массив `code_blocks` со всеми извлеченными блоками кода (или пустой массив `[]`, если кода в ответе нет). Если язык блока определить не удалось, используется `"unknown"`.
+
 ```json
 {
+  "model": "gemini-4-neon",
   "choices": [
     {
       "message": {
         "role": "assistant",
-        "content": "Квантовая запутанность — это феномен, при котором квантовые состояния двух или более объектов оказываются взаимосвязанными независимо от расстояния между ними. Изменение состояния одной частицы мгновенно приводит к соответствующему изменению состояния другой."
+        "content": "Квантовая запутанность — это феномен...\n\n```python\nprint('Hello world')\n```",
+        "code_blocks": [
+          {
+            "language": "python",
+            "code": "print('Hello world')"
+          }
+        ]
       }
     }
   ]
@@ -230,7 +253,19 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 }
 ```
 
-#### 2. Сессия истекла (HTTP 401 Unauthorized)
+#### 2. Неверный или отсутствующий API-ключ (HTTP 401 Unauthorized)
+Возникает, если отсутствует заголовок `Authorization: Bearer <API_KEY>` или передан неверный ключ:
+```json
+{
+  "error": {
+    "message": "Incorrect API key provided. You can find your API key in the environment variables.",
+    "type": "invalid_request_error",
+    "code": "invalid_api_key"
+  }
+}
+```
+
+#### 3. Сессия Google истекла (HTTP 401 Unauthorized)
 Возникает, если Google запросил повторный вход или сессионные куки протухли:
 ```json
 {
@@ -238,7 +273,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 }
 ```
 
-#### 3. Неверный формат запроса (HTTP 400 Bad Request)
+#### 4. Неверный формат запроса (HTTP 400 Bad Request)
 Возникает при отсутствии поля `messages` или пустом тексте сообщения:
 ```json
 {
@@ -265,7 +300,8 @@ Google периодически (раз в несколько недель ил�
    ```
 3. Вызовите эндпоинт горячей перезагрузки сессии:
    ```bash
-   curl -X POST http://localhost:3000/v1/auth/reload
+   curl -X POST http://localhost:3000/v1/auth/reload \
+     -H "Authorization: Bearer sk-custom-secret-key"
    ```
    Сервер перечитает файл `auth_state.json`, переинициализирует контекст браузера и снимет паузу с очереди.
 
@@ -278,7 +314,7 @@ Google периодически (раз в несколько недель ил�
 Возвращает текущее состояние воркера, загрузку очереди и потребление оперативной памяти процессом Node.js:
 
 ```bash
-curl http://localhost:3000/health
+curl -H "Authorization: Bearer sk-custom-secret-key" http://localhost:3000/health
 ```
 
 #### Пример ответа:
@@ -316,6 +352,7 @@ npm test
 
 ## 🛡 Безопасность и Best Practices
 
-* Сервер предназначен для использования в изолированной сети, за reverse-proxy (Nginx, Caddy, Cloudflare Tunnel) или с добавлением Bearer-токена авторизации.
+* Задавайте надежный `API_KEY` в `.env` или переменных окружения перед деплоем — в режиме `NODE_ENV=production` сервер отказывается запускаться без `API_KEY`.
+* Используйте HTTPS за reverse-proxy (Nginx, Caddy, Cloudflare Tunnel), чтобы защитить заголовок `Authorization: Bearer ...` в сети.
 * Не запускайте браузер под пользователем `root` (в Dockerfile используется `USER pwuser`).
 * Ограничивайте частоту запросов в соответствии с разумными лимитами интерфейса Gemini, чтобы избежать временных ограничений Google.

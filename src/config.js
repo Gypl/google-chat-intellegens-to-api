@@ -3,10 +3,42 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+export const DEFAULT_MODEL = 'gemini-4-neon';
+export const DEFAULT_THINKING_LEVEL = 'high';
+export const DEFAULT_API_KEY = 'sk-custom-secret-key';
+
+/**
+ * Resolves and validates API_KEY configuration.
+ * In production (NODE_ENV=production), refuses to start without an explicit non-empty API_KEY.
+ */
+export function resolveApiKey(env = process.env) {
+  const nodeEnv = typeof env.NODE_ENV === 'string' ? env.NODE_ENV.trim().toLowerCase() : '';
+  const isProduction = nodeEnv === 'production';
+  const rawApiKey = typeof env.API_KEY === 'string' ? env.API_KEY.trim() : '';
+
+  if (isProduction && !rawApiKey) {
+    const message =
+      '[Security] Fatal: API_KEY environment variable is required in production (NODE_ENV=production). ' +
+      'Set a strong API_KEY in your environment or .env before starting the server.';
+    console.error(message);
+    throw new Error(message);
+  }
+
+  return rawApiKey || DEFAULT_API_KEY;
+}
+
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   host: process.env.HOST || '0.0.0.0',
   logLevel: process.env.LOG_LEVEL || 'info',
+  nodeEnv: (process.env.NODE_ENV || 'development').trim().toLowerCase(),
+
+  // API Security
+  apiKey: resolveApiKey(process.env),
+
+  // Model & Thinking Level Defaults
+  defaultModel: process.env.DEFAULT_MODEL || DEFAULT_MODEL,
+  defaultThinkingLevel: process.env.DEFAULT_THINKING_LEVEL || DEFAULT_THINKING_LEVEL,
 
   // Authentication & Gemini Web URLs
   authStatePath: path.resolve(process.cwd(), process.env.AUTH_STATE_PATH || 'auth_state.json'),
