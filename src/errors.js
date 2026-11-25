@@ -21,3 +21,13 @@ export class BrowserWorkerError extends Error {
     this.statusCode = statusCode;
   }
 }
+
+export class GithubImportError extends BrowserWorkerError {
+  constructor(
+    message = 'Failed to attach GitHub repository. Ensure the repository is public and the URL is correct.'
+  ) {
+    super(message, 422);
+    this.name = 'GithubImportError';
+    this.code = 'github_import_failed';
+  }
+}

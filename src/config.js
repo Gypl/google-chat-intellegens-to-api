@@ -49,6 +49,7 @@ export const config = {
   maxQueueSize: parseInt(process.env.MAX_QUEUE_SIZE || '50', 10),
   generationTimeoutMs: parseInt(process.env.GENERATION_TIMEOUT_MS || '180000', 10),
   waitStopButtonTimeoutMs: parseInt(process.env.WAIT_STOP_BUTTON_TIMEOUT_MS || '15000', 10),
+  githubImportTimeoutMs: parseInt(process.env.GITHUB_IMPORT_TIMEOUT_MS || '10000', 10),
 
   // Optimized Chromium flags for low-memory VPS environments (<= 2GB RAM)
   chromiumArgs: [

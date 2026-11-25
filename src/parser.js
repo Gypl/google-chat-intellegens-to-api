@@ -7,6 +7,31 @@
 
 export const CODE_BLOCK_MARK_ATTR = 'data-gwa-code-idx';
 
+export const GITHUB_REPO_URL_REGEX =
+  /^https:\/\/github\.com\/((?!\.{1,2}(?:\/|$))[A-Za-z0-9_.-]+)\/((?!\.{1,2}(?:\.git)?(?:\/|$))[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/;
+
+/**
+ * Validates and parses a public GitHub repository URL (`https://github.com/<owner>/<repo>`).
+ * Returns `{ url, owner, repo, slug }` or `null` if invalid.
+ */
+export function parseGithubRepoUrl(rawUrl) {
+  if (typeof rawUrl !== 'string') {
+    return null;
+  }
+  const trimmed = rawUrl.trim();
+  const match = GITHUB_REPO_URL_REGEX.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const [, owner, repo] = match;
+  return {
+    url: trimmed,
+    owner,
+    repo,
+    slug: `${owner}/${repo}`
+  };
+}
+
 export const COPY_BUTTON_SELECTORS = [
   'button[aria-label*="copy" i]',
   'button[aria-label*="копир" i]',

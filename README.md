@@ -16,6 +16,7 @@
 * **Надежная детекция ответа:** Завершение генерации определяется моментом исчезновения кнопки *"Stop generating"* (*"Остановить генерацию"*) из DOM-дерева Gemini.
 * **Извлечение блоков кода (`code_blocks`):** Автоматический парсинг DOM-дерева (и опционально буфера обмена через кнопку *"Copy code"*) для возврата структурированного массива `{ language, code }` без номеров строк и UI-артефактов.
 * **Управление контекстом (`action` и `chat_id`):** Поддержка создания новых диалогов (`action: "new"`) и удержания/переключения контекста диалога (`action: "continue"` с `chat_id`).
+* **Импорт GitHub-репозиториев (`github_repo`):** Поддержка прикрепления публичных репозиториев GitHub к контексту промпта через интерфейс вложений Gemini с проверкой URL и обработкой ошибок (`422 github_import_failed`).
 * **Защита эндпоинтов (OpenAPI Bearer Auth):** Все эндпоинты защищены проверкой статического `API_KEY` через заголовок `Authorization: Bearer <API_KEY>` (OpenAI-совместимый формат ошибки `401 invalid_api_key`, timing-safe сравнение). В режиме `NODE_ENV=production` сервер отказывается запускаться без явно заданного `API_KEY`.
 * **Безопасная авторизация без логина на сервере:** Работает по предварительно экспортированному файлу сессии `auth_state.json`. При протухании сессии сервер возвращает `401 Unauthorized` и приостанавливает очередь.
 * **Готовность к Docker:** Поставляется с готовыми `Dockerfile` и `docker-compose.yml`.
@@ -182,6 +183,7 @@ npm start
 | `chat_id` | `string` | Нет | Идентификатор диалога. Позволяет удерживать сессию или переключаться по сохраненному URL чата. |
 | `model` | `string` | Нет (дефолт `"gemini-4-neon"`) | Имя или идентификатор модели (например, `"gemini-4-neon"`, `"neon"`, `"gemini-4-hydrogen"`, `"hydrogen"`). В интерфейсе отображается как `"Neon"`, `"Hydrogen"`. |
 | `thinking_level` | `string` (`"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"`) | Нет (дефолт `"high"`) | Уровень размышлений ИИ-модели (Thinking level). В интерфейсе Gemini отображается как `"High"`, `"Medium"`, `"Low"` и др. |
+| `github_repo` | `string` | Нет | URL публичного репозитория GitHub (начинается с `https://github.com/<owner>/<repo>`). Прикрепляет репозиторий к запросу перед отправкой промпта. |
 
 #### Пример запроса (Новый диалог с выбором модели):
 
@@ -274,11 +276,22 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 #### 4. Неверный формат запроса (HTTP 400 Bad Request)
-Возникает при отсутствии поля `messages` или пустом тексте сообщения:
+Возникает при отсутствии поля `messages`, пустом тексте сообщения или некорректном `github_repo`:
 ```json
 {
   "error": "Invalid request payload",
   "details": "body/messages must NOT have fewer than 1 items"
+}
+```
+
+#### 5. Ошибка импорта GitHub-репозитория (HTTP 422 Unprocessable Entity)
+Возникает, если репозиторий приватный, не существует, превышен таймаут ожидания чипа в UI или интеграция GitHub недоступна в аккаунте:
+```json
+{
+  "error": {
+    "message": "Failed to attach GitHub repository. Ensure the repository is public and the URL is correct.",
+    "code": "github_import_failed"
+  }
 }
 ```
 

@@ -4,8 +4,8 @@ import Fastify from 'fastify';
 import { config, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, resolveApiKey } from './config.js';
 import { browserWorker } from './browser.js';
 import { requestDispatcher } from './queue.js';
-import { QueueFullError, SessionExpiredError } from './errors.js';
-import { normalizeAssistantResult } from './parser.js';
+import { GithubImportError, QueueFullError, SessionExpiredError } from './errors.js';
+import { normalizeAssistantResult, parseGithubRepoUrl } from './parser.js';
 
 export { DEFAULT_MODEL, DEFAULT_THINKING_LEVEL };
 
@@ -65,6 +65,16 @@ export function buildServer(options = {}) {
 
     if (error instanceof SessionExpiredError || error.statusCode === 401) {
       return reply.status(401).send({ error: 'Session expired. Manual authentication required.' });
+    }
+
+    if (error instanceof GithubImportError || error.statusCode === 422) {
+      request.log.warn(error);
+      return reply.status(422).send({
+        error: {
+          message: 'Failed to attach GitHub repository. Ensure the repository is public and the URL is correct.',
+          code: error.code || 'github_import_failed'
+        }
+      });
     }
 
     if (error.validation) {
@@ -147,7 +157,8 @@ export function buildServer(options = {}) {
             },
             chat_id: { type: 'string' },
             model: { type: 'string' },
-            thinking_level: { type: 'string' }
+            thinking_level: { type: 'string' },
+            github_repo: { type: 'string' }
           }
         }
       }
@@ -158,8 +169,21 @@ export function buildServer(options = {}) {
         action = 'continue',
         chat_id,
         model = config.defaultModel,
-        thinking_level = config.defaultThinkingLevel
+        thinking_level = config.defaultThinkingLevel,
+        github_repo
       } = request.body;
+
+      // Validate optional github_repo URL before entering the browser queue
+      let validatedGithubRepo = null;
+      if (github_repo !== undefined) {
+        const parsedRepo = parseGithubRepoUrl(github_repo);
+        if (!parsedRepo) {
+          return reply.status(400).send({
+            error: 'Invalid github_repo URL. Expected a valid public GitHub repository URL starting with https://github.com/.'
+          });
+        }
+        validatedGithubRepo = parsedRepo.url;
+      }
 
       // Extract the latest user message
       const userMessages = messages.filter((m) => m.role === 'user');
@@ -188,7 +212,8 @@ export function buildServer(options = {}) {
         action,
         chatId: chat_id,
         model: targetModel,
-        thinkingLevel: targetThinkingLevel
+        thinkingLevel: targetThinkingLevel,
+        githubRepo: validatedGithubRepo
       });
 
       const { content, code_blocks } = normalizeAssistantResult(rawResult);

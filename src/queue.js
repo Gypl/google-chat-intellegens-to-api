@@ -1,6 +1,6 @@
 import PQueue from 'p-queue';
 import { config } from './config.js';
-import { QueueFullError, SessionExpiredError } from './errors.js';
+import { GithubImportError, QueueFullError, SessionExpiredError } from './errors.js';
 import { browserWorker } from './browser.js';
 
 export class RequestDispatcher {
@@ -31,7 +31,8 @@ export class RequestDispatcher {
     action = 'continue',
     chatId = null,
     model = config.defaultModel,
-    thinkingLevel = config.defaultThinkingLevel
+    thinkingLevel = config.defaultThinkingLevel,
+    githubRepo = null
   }) {
     // If paused due to expired session, reject immediately with 401
     if (this.isPausedForAuth) {
@@ -48,7 +49,8 @@ export class RequestDispatcher {
       try {
         const result = await browserWorker.sendMessage(prompt, action, chatId, {
           model,
-          thinkingLevel
+          thinkingLevel,
+          githubRepo
         });
         return result;
       } catch (err) {
@@ -56,6 +58,8 @@ export class RequestDispatcher {
           console.error('[RequestDispatcher] Session expired during request. Pausing and clearing queue.');
           this.isPausedForAuth = true;
           this.queue.clear();
+        } else if (err instanceof GithubImportError) {
+          console.warn(`[RequestDispatcher] GitHub import failed: ${err.message}`);
         }
         throw err;
       }

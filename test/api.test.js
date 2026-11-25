@@ -3,15 +3,17 @@ import { spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { chromium } from 'playwright';
 import { config, DEFAULT_API_KEY, resolveApiKey } from '../src/config.js';
+import { BrowserWorkerError, GithubImportError } from '../src/errors.js';
 import { buildServer, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, verifyBearerToken } from '../src/server.js';
 import { requestDispatcher } from '../src/queue.js';
-import { GeminiBrowserWorker, getModelRegex, getThinkingLevelRegex } from '../src/browser.js';
+import { browserWorker, GeminiBrowserWorker, getModelRegex, getThinkingLevelRegex } from '../src/browser.js';
 import {
   cleanCodeText,
   extractCodeBlocksFromMarkdown,
   extractResponseFromElement,
   normalizeAssistantResult,
-  normalizeLanguageLabel
+  normalizeLanguageLabel,
+  parseGithubRepoUrl
 } from '../src/parser.js';
 
 async function runTests() {
@@ -564,6 +566,282 @@ const pattern = '$$ and $&';</code></pre>
   console.log('✓ Test 13: OpenAPI Bearer auth, timing-safe comparison & production API_KEY enforcement verified');
 
   requestDispatcher.enqueue = originalEnqueue;
+
+  // Test 14: GitHub repository URL validation before queue
+  assert.deepEqual(parseGithubRepoUrl('https://github.com/expressjs/express'), {
+    url: 'https://github.com/expressjs/express',
+    owner: 'expressjs',
+    repo: 'express',
+    slug: 'expressjs/express'
+  });
+  assert.deepEqual(parseGithubRepoUrl('https://github.com/vercel/next.js/'), {
+    url: 'https://github.com/vercel/next.js/',
+    owner: 'vercel',
+    repo: 'next.js',
+    slug: 'vercel/next.js'
+  });
+  assert.deepEqual(parseGithubRepoUrl('https://github.com/expressjs/express.git'), {
+    url: 'https://github.com/expressjs/express.git',
+    owner: 'expressjs',
+    repo: 'express',
+    slug: 'expressjs/express'
+  });
+
+  const invalidRepoUrls = [
+    '',
+    '   ',
+    'http://github.com/expressjs/express',
+    'https://gitlab.com/expressjs/express',
+    'https://github.com/',
+    'https://github.com/expressjs',
+    'https://github.com/expressjs/',
+    'https://github.com/./express',
+    'https://github.com/expressjs/..',
+    'https://github.com/expressjs/express?tab=readme',
+    'not-a-url'
+  ];
+
+  let enqueueCalledForInvalidRepo = false;
+  requestDispatcher.enqueue = async () => {
+    enqueueCalledForInvalidRepo = true;
+    return 'Should never run';
+  };
+
+  for (const badUrl of invalidRepoUrls) {
+    assert.equal(parseGithubRepoUrl(badUrl), null, `Expected parseGithubRepoUrl to reject "${badUrl}"`);
+    const badRepoRes = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: authHeaders,
+      payload: {
+        messages: [{ role: 'user', content: 'Analyze repo' }],
+        github_repo: badUrl
+      }
+    });
+    assert.equal(badRepoRes.statusCode, 400, `Expected 400 for invalid github_repo "${badUrl}"`);
+  }
+  assert.equal(enqueueCalledForInvalidRepo, false, 'Invalid github_repo must be rejected before queue');
+
+  capturedPayload = null;
+  requestDispatcher.enqueue = async (params) => {
+    capturedPayload = params;
+    return { content: 'Repo analyzed', code_blocks: [] };
+  };
+  const validRepoRes = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    headers: authHeaders,
+    payload: {
+      messages: [{ role: 'user', content: 'Проанализируй архитектуру контроллеров в этом проекте.' }],
+      action: 'new',
+      github_repo: 'https://github.com/expressjs/express'
+    }
+  });
+  assert.equal(validRepoRes.statusCode, 200);
+  assert.equal(capturedPayload.githubRepo, 'https://github.com/expressjs/express');
+  console.log('✓ Test 14: github_repo URL validation before queue and payload forwarding verified');
+
+  // Test 15: GithubImportError hierarchy, queue pass-through & HTTP 422 response
+  const importErr = new GithubImportError('Repo private');
+  assert.ok(importErr instanceof GithubImportError);
+  assert.ok(importErr instanceof BrowserWorkerError);
+  assert.ok(importErr instanceof Error);
+  assert.equal(importErr.statusCode, 422);
+  assert.equal(importErr.code, 'github_import_failed');
+
+  requestDispatcher.enqueue = originalEnqueue;
+  const originalSendMessage = browserWorker.sendMessage;
+  let sendAttempt = 0;
+  browserWorker.sendMessage = async (_prompt, _action, _chatId, opts) => {
+    sendAttempt++;
+    if (opts.githubRepo === 'https://github.com/private/secret-repo') {
+      throw new GithubImportError('Private repository');
+    }
+    return { content: 'Queue still healthy', code_blocks: [] };
+  };
+
+  try {
+    const failedImportRes = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: authHeaders,
+      payload: {
+        messages: [{ role: 'user', content: 'Inspect repo' }],
+        github_repo: 'https://github.com/private/secret-repo'
+      }
+    });
+    assert.equal(failedImportRes.statusCode, 422);
+    assert.deepEqual(JSON.parse(failedImportRes.body), {
+      error: {
+        message: 'Failed to attach GitHub repository. Ensure the repository is public and the URL is correct.',
+        code: 'github_import_failed'
+      }
+    });
+    assert.equal(requestDispatcher.isPausedForAuth, false, 'GithubImportError must not pause the queue');
+
+    // Verify subsequent requests continue working normally after 422
+    const followUpRes = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: authHeaders,
+      payload: {
+        messages: [{ role: 'user', content: 'Normal follow-up' }]
+      }
+    });
+    assert.equal(followUpRes.statusCode, 200);
+    assert.equal(JSON.parse(followUpRes.body).choices[0].message.content, 'Queue still healthy');
+    assert.equal(sendAttempt, 2);
+  } finally {
+    browserWorker.sendMessage = originalSendMessage;
+  }
+  console.log('✓ Test 15: GithubImportError (422) formatting and queue resilience verified');
+
+  // Test 16: Real Playwright end-to-end GitHub repo attachment inside sendMessage (success, error, timeout, missing menu)
+  const ghBrowser = await chromium.launch({ headless: true, args: config.chromiumArgs });
+  const originalGhTimeout = config.githubImportTimeoutMs;
+  try {
+    const context = await ghBrowser.newContext();
+    const page = await context.newPage();
+    const worker = new GeminiBrowserWorker();
+    worker.browser = ghBrowser;
+    worker.context = context;
+    worker.page = page;
+    worker.isInitialized = true;
+    worker.checkSession = async () => { };
+    worker.handleAction = async () => { };
+
+    const callOrder = [];
+    const origSelect = worker.selectModelAndThinkingLevel.bind(worker);
+    worker.selectModelAndThinkingLevel = async (...args) => {
+      callOrder.push('selectModel');
+      return origSelect(...args);
+    };
+
+    // 16A: Full happy-path UI flow: model picker -> + button -> GitHub -> modal -> chip -> prompt fill -> send -> response
+    await page.setContent(`
+      <!doctype html>
+      <html>
+        <body>
+          <button data-test-id="bard-mode-menu-button">Neon High</button>
+          <div id="composer" class="input-area">
+            <div id="chips"></div>
+            <div id="spinner" class="loading-spinner" style="display:none;">Loading...</div>
+            <button id="attach-btn" aria-label="Upload file">+</button>
+            <rich-textarea>
+              <div contenteditable="true" role="textbox"></div>
+            </rich-textarea>
+            <button id="send-btn" aria-label="Send message">Send</button>
+          </div>
+          <div id="menu" role="menu" style="display:none;">
+            <div role="menuitem" id="gh-item">GitHub</div>
+          </div>
+          <div id="gh-modal" role="dialog" style="display:none;">
+            <input id="gh-url-input" type="url" placeholder="https://github.com/owner/repo" />
+            <div id="modal-err" role="alert" style="display:none;"></div>
+            <button id="gh-import-btn" type="submit">Import</button>
+            <button id="gh-cancel-btn" type="button">Cancel</button>
+          </div>
+          <div id="responses"></div>
+          <button id="stop-btn" aria-label="Stop generating" style="display:none;">Stop</button>
+          <script>
+            window.__events = [];
+            document.getElementById('attach-btn').addEventListener('click', () => {
+              window.__events.push('attach_clicked');
+              document.getElementById('menu').style.display = 'block';
+            });
+            document.getElementById('gh-item').addEventListener('click', () => {
+              window.__events.push('github_clicked');
+              document.getElementById('menu').style.display = 'none';
+              document.getElementById('gh-modal').style.display = 'block';
+            });
+            document.getElementById('gh-cancel-btn').addEventListener('click', () => {
+              document.getElementById('gh-modal').style.display = 'none';
+            });
+            document.getElementById('gh-import-btn').addEventListener('click', () => {
+              const val = document.getElementById('gh-url-input').value.trim();
+              window.__events.push('import_clicked:' + val);
+              if (val.includes('private/repo')) {
+                const err = document.getElementById('modal-err');
+                err.textContent = 'Repository not found or is private';
+                err.style.display = 'block';
+                return;
+              }
+              if (val.includes('hang/repo')) {
+                return; // Modal closes? Or spinner hangs without chip
+              }
+              document.getElementById('gh-modal').style.display = 'none';
+              document.getElementById('spinner').style.display = 'block';
+              setTimeout(() => {
+                document.getElementById('spinner').style.display = 'none';
+                const chip = document.createElement('div');
+                chip.className = 'attachment-chip';
+                chip.textContent = 'expressjs/express';
+                document.getElementById('chips').appendChild(chip);
+                window.__events.push('chip_rendered');
+              }, 120);
+            });
+            document.getElementById('send-btn').addEventListener('click', () => {
+              const promptTxt = document.querySelector('[role="textbox"]').innerText.trim();
+              const hasChip = document.getElementById('chips').textContent.includes('expressjs/express');
+              window.__events.push('send_clicked:' + promptTxt + ':chip=' + hasChip);
+              document.getElementById('stop-btn').style.display = 'inline-block';
+              setTimeout(() => {
+                const mr = document.createElement('model-response');
+                mr.innerHTML = '<message-content><div class="markdown"><p>Analyzed controllers.</p></div></message-content>';
+                document.getElementById('responses').appendChild(mr);
+                document.getElementById('stop-btn').style.display = 'none';
+              }, 80);
+            });
+          </script>
+        </body>
+      </html>
+    `);
+
+    const ghAnswer = await worker.sendMessage('Проанализируй архитектуру контроллеров', 'new', null, {
+      model: 'gemini-4-neon',
+      thinkingLevel: 'high',
+      githubRepo: 'https://github.com/expressjs/express'
+    });
+    assert.equal(ghAnswer.content, 'Analyzed controllers.');
+    const events = await page.evaluate(() => window.__events);
+    assert.equal(callOrder[0], 'selectModel');
+    assert.deepEqual(events, [
+      'attach_clicked',
+      'github_clicked',
+      'import_clicked:https://github.com/expressjs/express',
+      'chip_rendered',
+      'send_clicked:Проанализируй архитектуру контроллеров:chip=true'
+    ]);
+
+    // 16B: Private/non-existent repo shows error inside modal -> throws GithubImportError and dismisses modal
+    await assert.rejects(
+      () => worker.attachGithubRepository('https://github.com/private/repo'),
+      (err) => err instanceof GithubImportError && err.statusCode === 422 && err.code === 'github_import_failed'
+    );
+    const modalVisibleAfterError = await page.locator('#gh-modal').isVisible();
+    assert.equal(modalVisibleAfterError, false, 'Open GitHub modal must be dismissed after failure');
+
+    // 16C: Timeout waiting for chip -> throws GithubImportError and dismisses modal
+    config.githubImportTimeoutMs = 450;
+    await assert.rejects(
+      () => worker.attachGithubRepository('https://github.com/hang/repo'),
+      (err) => err instanceof GithubImportError && err.statusCode === 422
+    );
+    const modalVisibleAfterTimeout = await page.locator('#gh-modal').isVisible();
+    assert.equal(modalVisibleAfterTimeout, false, 'Open GitHub modal must be dismissed after timeout');
+
+    // 16D: Missing GitHub menu item -> throws GithubImportError
+    await page.setContent('<button aria-label="Upload file">+</button><div role="menu" style="display:none;"><div role="menuitem">Upload from computer</div></div>');
+    await assert.rejects(
+      () => worker.attachGithubRepository('https://github.com/expressjs/express'),
+      (err) => err instanceof GithubImportError
+    );
+
+    console.log('✓ Test 16: Playwright GitHub attachment flow (ordering, chip wait, error/timeout/missing-menu) verified');
+  } finally {
+    config.githubImportTimeoutMs = originalGhTimeout;
+    await ghBrowser.close().catch(() => { });
+  }
 
   await app.close();
   console.log('\n--- ALL TESTS PASSED SUCCESSFULLY ---');

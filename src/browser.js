@@ -1,13 +1,14 @@
 import fs from 'node:fs';
 import { chromium } from 'playwright';
 import { config } from './config.js';
-import { SessionExpiredError, BrowserWorkerError } from './errors.js';
+import { SessionExpiredError, BrowserWorkerError, GithubImportError } from './errors.js';
 import {
   CODE_BLOCK_MARK_ATTR,
   COPY_BUTTON_SELECTORS,
   cleanCodeText,
   extractCodeBlocksFromMarkdown,
-  extractResponseFromElement
+  extractResponseFromElement,
+  parseGithubRepoUrl
 } from './parser.js';
 
 /**
@@ -326,8 +327,8 @@ export class GeminiBrowserWorker {
       return;
     }
 
-    const currentText = (await btn.innerText().catch(() => '')).replace(/\s+/g, ' ').toLowerCase();
-    const currentAria = (await btn.getAttribute('aria-label').catch(() => '')).toLowerCase();
+    const currentText = ((await btn.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').toLowerCase();
+    const currentAria = ((await btn.getAttribute('aria-label').catch(() => '')) || '').toLowerCase();
 
     const { regex: modelRegex, cleanName: cleanModel } = getModelRegex(model);
     const thinkingRegex = getThinkingLevelRegex(thinkingLevel);
@@ -374,8 +375,8 @@ export class GeminiBrowserWorker {
 
     // Step 3: Thinking level selection
     // Note: selecting model closes the menu in Gemini, check if thinking level is still needed
-    const afterModelText = (await btn.innerText().catch(() => '')).replace(/\s+/g, ' ').toLowerCase();
-    const afterModelAria = (await btn.getAttribute('aria-label').catch(() => '')).toLowerCase();
+    const afterModelText = ((await btn.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').toLowerCase();
+    const afterModelAria = ((await btn.getAttribute('aria-label').catch(() => '')) || '').toLowerCase();
     const isThinkingStillActive = thinkingRegex.test(afterModelText) || thinkingRegex.test(afterModelAria);
 
     if (!isThinkingStillActive) {
@@ -433,15 +434,308 @@ export class GeminiBrowserWorker {
   }
 
   /**
+   * Returns the first visible locator among candidates within timeoutMs, or null.
+   */
+  async waitForFirstVisible(candidates, timeoutMs = 4000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      for (const candidate of candidates) {
+        if (await candidate.isVisible().catch(() => false)) {
+          return candidate;
+        }
+      }
+      await this.page.waitForTimeout(100);
+    }
+    return null;
+  }
+
+  /**
+   * Best-effort cleanup of open GitHub import dialogs/menus after an error so
+   * subsequent queued requests are not blocked.
+   */
+  async dismissGithubDialog() {
+    if (!this.page) return;
+    try {
+      const closeButtons = [
+        '[role="dialog"] button[aria-label*="close" i]',
+        '[role="dialog"] button:has-text("Cancel")',
+        '[role="dialog"] button:has-text("Close")',
+        '[role="dialog"] button:has-text("Отмена")',
+        '[role="dialog"] button:has-text("Закрыть")',
+        'mat-dialog-container button:has-text("Cancel")',
+        'mat-dialog-container button:has-text("Close")',
+        'mat-dialog-container button:has-text("Отмена")',
+        'mat-dialog-container button:has-text("Закрыть")'
+      ];
+      const closeBtn = this.page.locator(closeButtons.join(', ')).first();
+      if (await closeBtn.isVisible().catch(() => false)) {
+        await closeBtn.click({ timeout: 500 }).catch(() => { });
+      }
+      await this.page.keyboard.press('Escape').catch(() => { });
+      await this.page.waitForTimeout(150);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
+  /**
+   * Attaches a public GitHub repository to the current Gemini prompt via the UI attachment menu.
+   * Throws GithubImportError if the UI flow fails, times out, or displays an error.
+   */
+  async attachGithubRepository(githubRepo) {
+    const parsed = parseGithubRepoUrl(githubRepo);
+    if (!parsed) {
+      throw new GithubImportError(`Invalid GitHub repository URL: ${githubRepo}`);
+    }
+
+    const { url: repoUrl, slug: repoSlug, repo: repoName } = parsed;
+    const timeoutMs = config.githubImportTimeoutMs;
+    console.info(`[BrowserWorker] Attaching GitHub repository "${repoSlug}" (${repoUrl})...`);
+
+    try {
+      // 1. Open the attachment (+) menu near the prompt input
+      const attachmentBtn = await this.waitForFirstVisible(
+        [
+          this.page.locator('[data-test-id="upload-file-button"]').first(),
+          this.page.locator('button[aria-label*="Upload file" i]').first(),
+          this.page.locator('button[aria-label*="Add file" i]').first(),
+          this.page.locator('button[aria-label*="Open upload" i]').first(),
+          this.page.locator('button[aria-label*="Attach" i]').first(),
+          this.page.locator('button[aria-label*="Загрузить" i]').first(),
+          this.page.locator('button[aria-label*="Добавить файл" i]').first(),
+          this.page.locator('button[aria-label*="Прикрепить" i]').first(),
+          this.page.locator('uploader button, .input-area button:has(mat-icon[fonticon="add"])').first(),
+          this.page
+            .getByRole('button', { name: /upload|attachment|attach|add file|add|добавить|загрузить|прикрепить/i })
+            .first()
+        ],
+        Math.min(timeoutMs, 5000)
+      );
+
+      if (!attachmentBtn) {
+        throw new GithubImportError('Attachment (+) button not found in Gemini UI');
+      }
+      await attachmentBtn.click();
+
+      // 2. Select "GitHub" / "Add repository" from the opened menu
+      const githubOption = await this.waitForFirstVisible(
+        [
+          this.page
+            .locator('[role="menuitem"], [role="option"], mat-list-item, .mat-mdc-menu-item')
+            .filter({ hasText: /github|add repository|import code|репозитор/i })
+            .first(),
+          this.page.getByRole('menuitem', { name: /github|add repository|import code|репозитор/i }).first(),
+          this.page.getByText(/github/i, { exact: false }).first(),
+          this.page.getByText(/add repository/i, { exact: false }).first()
+        ],
+        Math.min(timeoutMs, 4000)
+      );
+
+      if (!githubOption) {
+        throw new GithubImportError('GitHub integration option not found in attachment menu');
+      }
+      await githubOption.click();
+
+      // 3. Wait for import dialog and URL input field
+      const dialogLocator = this.page.locator('[role="dialog"], mat-dialog-container, dialog').last();
+      const repoInput = await this.waitForFirstVisible(
+        [
+          this.page.locator('[role="dialog"] input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])').first(),
+          this.page.locator('mat-dialog-container input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])').first(),
+          this.page.locator('dialog input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])').first(),
+          this.page
+            .locator(
+              'input[placeholder*="github" i], input[aria-label*="github" i], input[placeholder*="repository" i], input[aria-label*="repository" i], input[placeholder*="url" i], input[aria-label*="url" i]'
+            )
+            .first()
+        ],
+        Math.min(timeoutMs, 5000)
+      );
+
+      if (!repoInput) {
+        throw new GithubImportError('GitHub repository URL input dialog did not appear');
+      }
+
+      const hadDialog = await dialogLocator.isVisible().catch(() => false);
+      await repoInput.fill(repoUrl);
+      await this.page.waitForTimeout(100);
+
+      // 4. Submit import dialog via Add/Import button or Enter
+      const confirmScope = hadDialog ? dialogLocator : this.page;
+      const confirmBtn = await this.waitForFirstVisible(
+        [
+          confirmScope.locator('button[type="submit"]').first(),
+          confirmScope
+            .locator('button')
+            .filter({
+              hasText: /^(import|add|connect|attach|confirm|submit|импорт|импортировать|добавить|подключить|прикрепить)$/i
+            })
+            .first(),
+          confirmScope
+            .locator('button')
+            .filter({ hasText: /import|add repository|добавить|импортировать/i })
+            .first()
+        ],
+        600
+      );
+
+      if (confirmBtn) {
+        const btnDeadline = Date.now() + 800;
+        let disabled = await confirmBtn.isDisabled().catch(() => false);
+        while (disabled && Date.now() < btnDeadline) {
+          await this.page.waitForTimeout(100);
+          disabled = await confirmBtn.isDisabled().catch(() => false);
+        }
+        if (!disabled) {
+          await confirmBtn.click();
+        } else {
+          await repoInput.press('Enter');
+        }
+      } else {
+        await repoInput.press('Enter');
+      }
+
+      // 5. Critical wait: dialog closed, no spinner, no error, and chip rendered in input area
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() <= deadline) {
+        const state = await this.page.evaluate(
+          ({ slug, repo, expectDialogClose }) => {
+            const isVisible = (el) => {
+              if (!el || el.nodeType !== 1) return false;
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                return false;
+              }
+              return el.getClientRects().length > 0;
+            };
+
+            const errorRe =
+              /(private|not found|invalid|unable to|failed|cannot|could not|doesn't exist|does not exist|access denied|permission|не найден|приватн|ошибка|не удалось|недоступ)/i;
+
+            const dialogs = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container, dialog')).filter(
+              isVisible
+            );
+            const dialogOpen = dialogs.length > 0;
+
+            for (const dlg of dialogs) {
+              const errEl = Array.from(
+                dlg.querySelectorAll('[role="alert"], .error, .error-message, mat-error, .mat-mdc-form-field-error')
+              ).find((e) => isVisible(e) && (e.innerText || e.textContent || '').trim().length > 0);
+              if (errEl) {
+                return { status: 'error', reason: (errEl.innerText || errEl.textContent).trim() };
+              }
+              const dlgText = (dlg.innerText || '').trim();
+              if (dlgText && errorRe.test(dlgText)) {
+                return { status: 'error', reason: dlgText };
+              }
+            }
+
+            const toasts = Array.from(
+              document.querySelectorAll('[role="alert"], mat-snack-bar-container, .snackbar, .error-toast')
+            ).filter((e) => isVisible(e) && !e.closest('[role="dialog"], mat-dialog-container, dialog'));
+            for (const toast of toasts) {
+              const toastText = (toast.innerText || toast.textContent || '').trim();
+              if (toastText && errorRe.test(toastText)) {
+                return { status: 'error', reason: toastText };
+              }
+            }
+
+            if (expectDialogClose && dialogOpen) {
+              return { status: 'waiting_dialog' };
+            }
+
+            const spinners = Array.from(
+              document.querySelectorAll(
+                'mat-spinner, mat-progress-spinner, [role="progressbar"], .loading-spinner, .spinner'
+              )
+            ).filter((s) => isVisible(s) && !s.closest('model-response'));
+            if (spinners.length > 0) {
+              return { status: 'waiting_spinner' };
+            }
+
+            const escapeRe = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const slugRe = new RegExp(escapeRe(slug), 'i');
+            const repoRe = new RegExp(`\\b${escapeRe(repo)}\\b`, 'i');
+
+            const isChipContextExcluded = (el) =>
+              Boolean(
+                el === document.body ||
+                el === document.documentElement ||
+                el.closest(
+                  '[role="dialog"], mat-dialog-container, dialog, model-response, message-content, nav, aside, header, bard-sidenav, [role="navigation"], script, style'
+                )
+              );
+
+            // Priority 1: explicit chip / attachment / preview elements
+            const chipEls = Array.from(
+              document.querySelectorAll(
+                'mat-chip, mat-chip-row, uploader-file-preview, [class*="chip" i], [class*="attachment" i], [class*="file-preview" i], [data-test-id*="file" i], [data-test-id*="chip" i], [data-test-id*="repo" i], [data-test-id*="github" i]'
+              )
+            ).filter((el) => isVisible(el) && !isChipContextExcluded(el));
+
+            for (const chip of chipEls) {
+              const txt = (chip.innerText || chip.textContent || '').trim();
+              if (slugRe.test(txt) || repoRe.test(txt)) {
+                return { status: 'attached' };
+              }
+            }
+
+            // Priority 2: any visible non-dialog, non-response element displaying owner/repo slug
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+            let node;
+            while ((node = walker.nextNode())) {
+              if (
+                node.tagName === 'INPUT' ||
+                node.tagName === 'TEXTAREA' ||
+                !isVisible(node) ||
+                isChipContextExcluded(node)
+              ) {
+                continue;
+              }
+              const txt = (node.innerText || '').trim();
+              if (txt && txt.length < 200 && slugRe.test(txt)) {
+                return { status: 'attached' };
+              }
+            }
+
+            return { status: 'waiting_chip' };
+          },
+          { slug: repoSlug, repo: repoName, expectDialogClose: hadDialog }
+        );
+
+        if (state.status === 'attached') {
+          console.info(`[BrowserWorker] GitHub repository "${repoSlug}" attached successfully.`);
+          return;
+        }
+        if (state.status === 'error') {
+          throw new GithubImportError(`GitHub import UI reported an error: ${state.reason}`);
+        }
+
+        await this.page.waitForTimeout(150);
+      }
+
+      throw new GithubImportError(`Timed out waiting ${timeoutMs}ms for GitHub repository chip "${repoSlug}"`);
+    } catch (err) {
+      await this.dismissGithubDialog();
+      if (err instanceof GithubImportError) {
+        throw err;
+      }
+      throw new GithubImportError(`Failed to attach GitHub repository "${repoSlug}": ${err.message}`);
+    }
+  }
+
+  /**
    * Sends prompt and waits for full completion.
    */
   async sendMessage(prompt, action = 'continue', chatId = null, options = {}) {
     let targetModel = config.defaultModel;
     let targetThinkingLevel = config.defaultThinkingLevel;
+    let targetGithubRepo = null;
 
     if (typeof options === 'object' && options !== null) {
       if (options.model) targetModel = options.model;
       if (options.thinkingLevel) targetThinkingLevel = options.thinkingLevel;
+      if (options.githubRepo) targetGithubRepo = options.githubRepo;
     } else if (typeof options === 'string') {
       targetModel = options;
       if (arguments[4]) targetThinkingLevel = arguments[4];
@@ -462,8 +756,13 @@ export class GeminiBrowserWorker {
 
     await this.handleAction(action, chatId);
 
-    // Verify and apply requested model and thinking level before entering prompt
+    // Verify and apply requested model and thinking level before attaching files or entering prompt
     await this.selectModelAndThinkingLevel(targetModel, targetThinkingLevel);
+
+    // Attach optional GitHub repository strictly after model selection and before prompt input
+    if (targetGithubRepo) {
+      await this.attachGithubRepository(targetGithubRepo);
+    }
 
     // Locate the prompt input area
     const inputSelectors = [
