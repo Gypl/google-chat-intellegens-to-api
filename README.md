@@ -16,6 +16,7 @@
 * **Надежная детекция ответа:** Завершение генерации определяется моментом исчезновения кнопки *"Stop generating"* (*"Остановить генерацию"*) из DOM-дерева Gemini.
 * **Извлечение блоков кода (`code_blocks`):** Автоматический парсинг DOM-дерева (и опционально буфера обмена через кнопку *"Copy code"*) для возврата структурированного массива `{ language, code }` без номеров строк и UI-артефактов.
 * **Управление контекстом (`action` и `chat_id`):** Поддержка создания новых диалогов (`action: "new"`) и удержания/переключения контекста диалога (`action: "continue"` с `chat_id`).
+* **Защита эндпоинтов (OpenAPI Bearer Auth):** Все эндпоинты защищены проверкой статического `API_KEY` через заголовок `Authorization: Bearer <API_KEY>` (OpenAI-совместимый формат ошибки `401 invalid_api_key`, timing-safe сравнение). В режиме `NODE_ENV=production` сервер отказывается запускаться без явно заданного `API_KEY`.
 * **Безопасная авторизация без логина на сервере:** Работает по предварительно экспортированному файлу сессии `auth_state.json`. При протухании сессии сервер возвращает `401 Unauthorized` и приостанавливает очередь.
 * **Готовность к Docker:** Поставляется с готовыми `Dockerfile` и `docker-compose.yml`.
 
@@ -166,6 +167,8 @@ npm start
 
 ## 📡 Спецификация API (Endpoints & Payloads)
 
+Все эндпоинты API защищены схемой **OpenAPI 3.0 HTTP Bearer** (`Authorization: Bearer <API_KEY>`).
+
 ### 1. `POST /v1/chat/completions`
 
 Основной эндпоинт отправки промптов и получения ответа.
@@ -184,6 +187,7 @@ npm start
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-custom-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -200,6 +204,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-custom-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -248,7 +253,19 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 }
 ```
 
-#### 2. Сессия истекла (HTTP 401 Unauthorized)
+#### 2. Неверный или отсутствующий API-ключ (HTTP 401 Unauthorized)
+Возникает, если отсутствует заголовок `Authorization: Bearer <API_KEY>` или передан неверный ключ:
+```json
+{
+  "error": {
+    "message": "Incorrect API key provided. You can find your API key in the environment variables.",
+    "type": "invalid_request_error",
+    "code": "invalid_api_key"
+  }
+}
+```
+
+#### 3. Сессия Google истекла (HTTP 401 Unauthorized)
 Возникает, если Google запросил повторный вход или сессионные куки протухли:
 ```json
 {
@@ -256,7 +273,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 }
 ```
 
-#### 3. Неверный формат запроса (HTTP 400 Bad Request)
+#### 4. Неверный формат запроса (HTTP 400 Bad Request)
 Возникает при отсутствии поля `messages` или пустом тексте сообщения:
 ```json
 {
@@ -283,7 +300,8 @@ Google периодически (раз в несколько недель ил�
    ```
 3. Вызовите эндпоинт горячей перезагрузки сессии:
    ```bash
-   curl -X POST http://localhost:3000/v1/auth/reload
+   curl -X POST http://localhost:3000/v1/auth/reload \
+     -H "Authorization: Bearer sk-custom-secret-key"
    ```
    Сервер перечитает файл `auth_state.json`, переинициализирует контекст браузера и снимет паузу с очереди.
 
@@ -296,7 +314,7 @@ Google периодически (раз в несколько недель ил�
 Возвращает текущее состояние воркера, загрузку очереди и потребление оперативной памяти процессом Node.js:
 
 ```bash
-curl http://localhost:3000/health
+curl -H "Authorization: Bearer sk-custom-secret-key" http://localhost:3000/health
 ```
 
 #### Пример ответа:
@@ -334,6 +352,7 @@ npm test
 
 ## 🛡 Безопасность и Best Practices
 
-* Сервер предназначен для использования в изолированной сети, за reverse-proxy (Nginx, Caddy, Cloudflare Tunnel) или с добавлением Bearer-токена авторизации.
+* Задавайте надежный `API_KEY` в `.env` или переменных окружения перед деплоем — в режиме `NODE_ENV=production` сервер отказывается запускаться без `API_KEY`.
+* Используйте HTTPS за reverse-proxy (Nginx, Caddy, Cloudflare Tunnel), чтобы защитить заголовок `Authorization: Bearer ...` в сети.
 * Не запускайте браузер под пользователем `root` (в Dockerfile используется `USER pwuser`).
 * Ограничивайте частоту запросов в соответствии с разумными лимитами интерфейса Gemini, чтобы избежать временных ограничений Google.

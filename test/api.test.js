@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { chromium } from 'playwright';
-import { config } from '../src/config.js';
-import { buildServer, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL } from '../src/server.js';
+import { config, DEFAULT_API_KEY, resolveApiKey } from '../src/config.js';
+import { buildServer, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, verifyBearerToken } from '../src/server.js';
 import { requestDispatcher } from '../src/queue.js';
 import { GeminiBrowserWorker, getModelRegex, getThinkingLevelRegex } from '../src/browser.js';
 import {
@@ -18,6 +19,10 @@ async function runTests() {
   const app = buildServer();
   await app.ready();
 
+  const authHeaders = {
+    authorization: `Bearer ${config.apiKey}`
+  };
+
   // Test 0: Defaults verification
   if (DEFAULT_MODEL !== 'gemini-4-neon') {
     throw new Error(`Expected DEFAULT_MODEL to be 'gemini-4-neon', got '${DEFAULT_MODEL}'`);
@@ -25,10 +30,15 @@ async function runTests() {
   if (DEFAULT_THINKING_LEVEL !== 'high') {
     throw new Error(`Expected DEFAULT_THINKING_LEVEL to be 'high', got '${DEFAULT_THINKING_LEVEL}'`);
   }
-  console.log('✓ Test 0: DEFAULT_MODEL and DEFAULT_THINKING_LEVEL constants verified');
+  assert.equal(DEFAULT_API_KEY, 'sk-custom-secret-key');
+  console.log('✓ Test 0: DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, and DEFAULT_API_KEY constants verified');
 
-  // Test 1: GET /health
-  const healthRes = await app.inject({ method: 'GET', url: '/health' });
+  // Test 1: GET /health (authorized)
+  const healthRes = await app.inject({
+    method: 'GET',
+    url: '/health',
+    headers: authHeaders
+  });
   if (healthRes.statusCode !== 200) {
     throw new Error(`Expected /health status 200, got ${healthRes.statusCode}`);
   }
@@ -38,10 +48,11 @@ async function runTests() {
   }
   console.log('✓ Test 1: GET /health returned 200 OK');
 
-  // Test 2: Validation of empty payload
+  // Test 2: Validation of empty payload (authorized)
   const badReq = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: { messages: [] }
   });
   if (badReq.statusCode !== 400) {
@@ -54,6 +65,7 @@ async function runTests() {
   const authRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'test message' }]
     }
@@ -74,6 +86,7 @@ async function runTests() {
   const qFullRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'test queue full' }]
     }
@@ -99,6 +112,7 @@ async function runTests() {
   const defaultParamsRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'Hello Gemini' }]
     }
@@ -131,6 +145,7 @@ async function runTests() {
   const explicitRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'Текст запроса...' }],
       action: 'new',
@@ -162,6 +177,7 @@ async function runTests() {
   const customRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'Solve fast' }],
       model: 'gemini-4-hydrogen',
@@ -216,6 +232,7 @@ async function runTests() {
   const codeApiRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'Show JS and Python examples' }]
     }
@@ -233,6 +250,7 @@ async function runTests() {
   const mdApiRes = await app.inject({
     method: 'POST',
     url: '/v1/chat/completions',
+    headers: authHeaders,
     payload: {
       messages: [{ role: 'user', content: 'Markdown string fallback' }]
     }
@@ -448,6 +466,103 @@ const pattern = '$$ and $&';</code></pre>
   }
 
   // Restore enqueue
+  requestDispatcher.enqueue = originalEnqueue;
+
+  // Test 13: OpenAPI Bearer Authentication & Production API_KEY Enforcement
+  const expectedAuthError = {
+    error: {
+      message: 'Incorrect API key provided. You can find your API key in the environment variables.',
+      type: 'invalid_request_error',
+      code: 'invalid_api_key'
+    }
+  };
+
+  let enqueueCalledWithoutAuth = false;
+  requestDispatcher.enqueue = async () => {
+    enqueueCalledWithoutAuth = true;
+    return 'Should never run';
+  };
+
+  // Protected endpoints must reject missing/malformed/wrong auth headers with 401
+  const unauthorizedCases = [
+    { method: 'GET', url: '/health', headers: {} },
+    { method: 'POST', url: '/v1/auth/reload', headers: {} },
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {},
+      payload: { messages: [] } // invalid payload must still fail 401 before schema validation
+    },
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { authorization: config.apiKey }, // missing Bearer prefix
+      payload: { messages: [{ role: 'user', content: 'hi' }] }
+    },
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { authorization: `Basic ${config.apiKey}` },
+      payload: { messages: [{ role: 'user', content: 'hi' }] }
+    },
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { authorization: 'Bearer   ' },
+      payload: { messages: [{ role: 'user', content: 'hi' }] }
+    },
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { authorization: 'Bearer sk-wrong-key' },
+      payload: { messages: [{ role: 'user', content: 'hi' }] }
+    }
+  ];
+
+  for (const testCase of unauthorizedCases) {
+    const res = await app.inject(testCase);
+    assert.equal(res.statusCode, 401, `Expected 401 for ${testCase.method} ${testCase.url}`);
+    assert.deepEqual(JSON.parse(res.body), expectedAuthError);
+  }
+  assert.equal(enqueueCalledWithoutAuth, false, 'Queue must never receive unauthenticated requests');
+
+  // Case-insensitive Bearer prefix should succeed
+  requestDispatcher.enqueue = async () => ({ content: 'Authorized OK', code_blocks: [] });
+  for (const prefix of ['Bearer', 'bearer', 'BEARER']) {
+    const okRes = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { authorization: `${prefix} ${config.apiKey}` },
+      payload: { messages: [{ role: 'user', content: 'auth check' }] }
+    });
+    assert.equal(okRes.statusCode, 200);
+    assert.equal(JSON.parse(okRes.body).choices[0].message.content, 'Authorized OK');
+  }
+
+  // Unit tests for timing-safe verification & resolveApiKey
+  assert.equal(verifyBearerToken(`Bearer ${config.apiKey}`, config.apiKey), true);
+  assert.equal(verifyBearerToken(`bearer ${config.apiKey}`, config.apiKey), true);
+  assert.equal(verifyBearerToken('Bearer short', 'much-longer-secret-key'), false);
+  assert.equal(verifyBearerToken(`Bearer ${config.apiKey}`, ''), false);
+  assert.equal(verifyBearerToken(undefined, config.apiKey), false);
+
+  assert.equal(resolveApiKey({ NODE_ENV: 'development' }), 'sk-custom-secret-key');
+  assert.equal(resolveApiKey({ NODE_ENV: 'development', API_KEY: 'sk-dev-123' }), 'sk-dev-123');
+  assert.equal(resolveApiKey({ NODE_ENV: 'production', API_KEY: 'sk-prod-123' }), 'sk-prod-123');
+  assert.throws(() => resolveApiKey({ NODE_ENV: 'production' }), /API_KEY/i);
+  assert.throws(() => resolveApiKey({ NODE_ENV: 'production', API_KEY: '   ' }), /API_KEY/i);
+
+  // Subprocess crash verification when NODE_ENV=production and API_KEY is empty
+  const prodCrash = spawnSync(process.execPath, ['src/server.js'], {
+    cwd: process.cwd(),
+    env: { ...process.env, NODE_ENV: 'production', API_KEY: '' },
+    encoding: 'utf8',
+    timeout: 5000
+  });
+  assert.notEqual(prodCrash.status, 0, 'Production server must crash when API_KEY is missing');
+  assert.match(prodCrash.stderr + prodCrash.stdout, /API_KEY/i);
+  console.log('✓ Test 13: OpenAPI Bearer auth, timing-safe comparison & production API_KEY enforcement verified');
+
   requestDispatcher.enqueue = originalEnqueue;
 
   await app.close();

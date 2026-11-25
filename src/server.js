@@ -1,6 +1,7 @@
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
-import { config, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL } from './config.js';
+import { config, DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, resolveApiKey } from './config.js';
 import { browserWorker } from './browser.js';
 import { requestDispatcher } from './queue.js';
 import { QueueFullError, SessionExpiredError } from './errors.js';
@@ -8,10 +9,51 @@ import { normalizeAssistantResult } from './parser.js';
 
 export { DEFAULT_MODEL, DEFAULT_THINKING_LEVEL };
 
-export function buildServer() {
+const INVALID_API_KEY_RESPONSE = {
+  error: {
+    message: 'Incorrect API key provided. You can find your API key in the environment variables.',
+    type: 'invalid_request_error',
+    code: 'invalid_api_key'
+  }
+};
+
+/**
+ * Constant-time Bearer token comparison using SHA-256 digests so lengths are never leaked.
+ */
+export function verifyBearerToken(authHeader, expectedApiKey) {
+  if (typeof authHeader !== 'string' || typeof expectedApiKey !== 'string' || !expectedApiKey) {
+    return false;
+  }
+
+  const match = /^Bearer[ \t]+(.+)$/i.exec(authHeader);
+  if (!match) {
+    return false;
+  }
+
+  const providedToken = match[1].trim();
+  if (!providedToken) {
+    return false;
+  }
+
+  const providedDigest = crypto.createHash('sha256').update(providedToken, 'utf8').digest();
+  const expectedDigest = crypto.createHash('sha256').update(expectedApiKey, 'utf8').digest();
+  return crypto.timingSafeEqual(providedDigest, expectedDigest);
+}
+
+export function buildServer(options = {}) {
   const fastify = Fastify({
     logger: {
       level: config.logLevel
+    }
+  });
+
+  // Global OpenAPI Bearer Authentication Hook (runs before validation and queue)
+  fastify.addHook('onRequest', async (request, reply) => {
+    const expectedApiKey = options.apiKey ?? config.apiKey;
+    const authHeader = request.headers.authorization;
+
+    if (!verifyBearerToken(authHeader, expectedApiKey)) {
+      return reply.status(401).send(INVALID_API_KEY_RESPONSE);
     }
   });
 
@@ -177,6 +219,9 @@ export const server = buildServer();
  */
 export async function start() {
   try {
+    // 0. Ensure API key is configured for current environment
+    config.apiKey = resolveApiKey(process.env);
+
     // 1. Initialize browser worker
     console.info('[Server] Starting Gemini Browser Worker...');
     await browserWorker.init().catch((err) => {
